@@ -13,6 +13,42 @@ cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
 # This will hold every recent story from every source.
 all_stories = []
 
+
+def classify_story(title):
+    """
+    Give each story a simple category based on its headline.
+    This is intentionally basic for now.
+    """
+
+    title_lower = title.lower()
+
+    if any(word in title_lower for word in [
+        "recipe",
+        "air fryer",
+        "dorm-friendly"
+    ]):
+        return "lifestyle"
+
+    if any(word in title_lower for word in [
+        "letters:",
+        "letter:",
+        "opinion:",
+        "column:",
+        "view:"
+    ]):
+        return "opinion"
+
+    if any(word in title_lower for word in [
+        "podcast",
+        "video",
+        "gallery",
+        "cartoonists"
+    ]):
+        return "feature"
+
+    return "news"
+
+
 print("MORNING NEWS DIGEST")
 print("=" * 50)
 
@@ -45,11 +81,14 @@ for name, url in FEEDS.items():
             if published < cutoff_time:
                 continue
 
+            title = article.get("title", "No title")
+
             story = {
                 "source": name,
-                "title": article.get("title", "No title"),
+                "title": title,
                 "link": article.get("link", "No link"),
-                "published": published
+                "published": published,
+                "category": classify_story(title)
             }
 
             all_stories.append(story)
@@ -69,6 +108,7 @@ all_stories.sort(
     reverse=True
 )
 
+
 print("\n\nALL RECENT STORIES")
 print("=" * 50)
 
@@ -78,5 +118,6 @@ for story in all_stories:
     print(
         f"\n{story['published'].strftime('%Y-%m-%d %H:%M UTC')}"
     )
+    print(f"Category: {story['category']}")
     print(f"{story['source']}: {story['title']}")
     print(story["link"])
