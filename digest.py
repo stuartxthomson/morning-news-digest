@@ -1,4 +1,8 @@
 import feedparser
+import socket
+
+# Don't wait forever if a website doesn't respond.
+socket.setdefaulttimeout(10)
 
 feeds = {
     "CBC News": "https://rss.cbc.ca/lineup/topstories.xml",
@@ -14,6 +18,8 @@ for name, url in feeds.items():
     print("-" * 50)
 
     feed = feedparser.parse(url)
+
+    print(f"Found {len(feed.entries)} articles")
 
     for article in feed.entries[:5]:
         print(article.title)
