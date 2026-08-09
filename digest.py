@@ -24,19 +24,40 @@ for name, url in FEEDS.items():
             print("Could not retrieve this feed. Skipping it.")
             continue
 
-        recent_articles = []
+        print(f"Feed contains {len(feed.entries)} total articles")
 
-        for article in feed.entries:
-            # RSS feeds normally give feedparser a structured date.
+        # Diagnostic: show the dates of the five newest stories.
+        print("Newest stories in feed:")
+
+        for article in feed.entries[:5]:
+            title = article.get("title", "No title")
             published_time = article.get("published_parsed")
 
             if published_time:
-                published = datetime(*published_time[:6], tzinfo=timezone.utc)
+                published = datetime(
+                    *published_time[:6],
+                    tzinfo=timezone.utc
+                )
+                print(f"  {published.isoformat()} — {title}")
+            else:
+                print(f"  NO DATE — {title}")
+
+        # Now filter to the last 24 hours.
+        recent_articles = []
+
+        for article in feed.entries:
+            published_time = article.get("published_parsed")
+
+            if published_time:
+                published = datetime(
+                    *published_time[:6],
+                    tzinfo=timezone.utc
+                )
 
                 if published >= cutoff_time:
                     recent_articles.append(article)
 
-        print(f"Found {len(recent_articles)} articles from the last 24 hours")
+        print(f"\nFound {len(recent_articles)} articles from the last 24 hours")
 
         for article in recent_articles[:5]:
             title = article.get("title", "No title")
@@ -45,7 +66,10 @@ for name, url in FEEDS.items():
             published_time = article.get("published_parsed")
 
             if published_time:
-                published = datetime(*published_time[:6], tzinfo=timezone.utc)
+                published = datetime(
+                    *published_time[:6],
+                    tzinfo=timezone.utc
+                )
                 published_display = published.strftime("%Y-%m-%d %H:%M UTC")
             else:
                 published_display = "Unknown date"
