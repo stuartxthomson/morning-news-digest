@@ -1,19 +1,15 @@
 import feedparser
 import socket
 
+from sources import FEEDS
+
 # Don't wait forever if a website doesn't respond.
 socket.setdefaulttimeout(10)
-
-feeds = {
-    "CBC News": "https://rss.cbc.ca/lineup/topstories.xml",
-    "CTV News": "https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009",
-    "Global News": "https://globalnews.ca/feed/"
-}
 
 print("MORNING NEWS DIGEST")
 print("=" * 50)
 
-for name, url in feeds.items():
+for name, url in FEEDS.items():
     print(f"\n{name}")
     print("-" * 50)
 
@@ -32,6 +28,6 @@ for name, url in feeds.items():
             print()
 
     except Exception as error:
-        print(f"Could not retrieve this feed. Skipping it.")
+        print("Could not retrieve this feed. Skipping it.")
         print(f"Error: {error}")
         continue
