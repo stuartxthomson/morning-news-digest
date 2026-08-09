@@ -23,8 +23,18 @@ for name, url in FEEDS.items():
         print(f"Found {len(feed.entries)} articles")
 
         for article in feed.entries[:5]:
-            print(article.title)
-            print(article.link)
+            title = article.get("title", "No title")
+            link = article.get("link", "No link")
+
+            # RSS feeds don't all use exactly the same date field.
+            published = article.get(
+                "published",
+                article.get("updated", "Unknown date")
+            )
+
+            print(f"{published}")
+            print(title)
+            print(link)
             print()
 
     except Exception as error:
