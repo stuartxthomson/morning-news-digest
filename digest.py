@@ -1,10 +1,14 @@
 import feedparser
 import socket
+from datetime import datetime, timedelta, timezone
 
 from sources import FEEDS
 
 # Don't wait forever if a website doesn't respond.
 socket.setdefaulttimeout(10)
+
+# Only include stories published in the last 24 hours.
+cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
 
 print("MORNING NEWS DIGEST")
 print("=" * 50)
@@ -20,19 +24,33 @@ for name, url in FEEDS.items():
             print("Could not retrieve this feed. Skipping it.")
             continue
 
-        print(f"Found {len(feed.entries)} articles")
+        recent_articles = []
 
-        for article in feed.entries[:5]:
+        for article in feed.entries:
+            # RSS feeds normally give feedparser a structured date.
+            published_time = article.get("published_parsed")
+
+            if published_time:
+                published = datetime(*published_time[:6], tzinfo=timezone.utc)
+
+                if published >= cutoff_time:
+                    recent_articles.append(article)
+
+        print(f"Found {len(recent_articles)} articles from the last 24 hours")
+
+        for article in recent_articles[:5]:
             title = article.get("title", "No title")
             link = article.get("link", "No link")
 
-            # RSS feeds don't all use exactly the same date field.
-            published = article.get(
-                "published",
-                article.get("updated", "Unknown date")
-            )
+            published_time = article.get("published_parsed")
 
-            print(f"{published}")
+            if published_time:
+                published = datetime(*published_time[:6], tzinfo=timezone.utc)
+                published_display = published.strftime("%Y-%m-%d %H:%M UTC")
+            else:
+                published_display = "Unknown date"
+
+            print(published_display)
             print(title)
             print(link)
             print()
