@@ -17,11 +17,21 @@ for name, url in feeds.items():
     print(f"\n{name}")
     print("-" * 50)
 
-    feed = feedparser.parse(url)
+    try:
+        feed = feedparser.parse(url)
 
-    print(f"Found {len(feed.entries)} articles")
+        if feed.bozo and not feed.entries:
+            print("Could not retrieve this feed. Skipping it.")
+            continue
 
-    for article in feed.entries[:5]:
-        print(article.title)
-        print(article.link)
-        print()
+        print(f"Found {len(feed.entries)} articles")
+
+        for article in feed.entries[:5]:
+            print(article.title)
+            print(article.link)
+            print()
+
+    except Exception as error:
+        print(f"Could not retrieve this feed. Skipping it.")
+        print(f"Error: {error}")
+        continue
