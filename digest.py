@@ -10,6 +10,9 @@ socket.setdefaulttimeout(10)
 # Only include stories published in the last 24 hours.
 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
 
+# This will hold every recent story from every source.
+all_stories = []
+
 print("MORNING NEWS DIGEST")
 print("=" * 50)
 
@@ -24,62 +27,56 @@ for name, url in FEEDS.items():
             print("Could not retrieve this feed. Skipping it.")
             continue
 
-        print(f"Feed contains {len(feed.entries)} total articles")
-
-        # Diagnostic: show the dates of the five newest stories.
-        print("Newest stories in feed:")
-
-        for article in feed.entries[:5]:
-            title = article.get("title", "No title")
-            published_time = article.get("published_parsed")
-
-            if published_time:
-                published = datetime(
-                    *published_time[:6],
-                    tzinfo=timezone.utc
-                )
-                print(f"  {published.isoformat()} — {title}")
-            else:
-                print(f"  NO DATE — {title}")
-
-        # Now filter to the last 24 hours.
-        recent_articles = []
+        source_count = 0
 
         for article in feed.entries:
             published_time = article.get("published_parsed")
 
-            if published_time:
-                published = datetime(
-                    *published_time[:6],
-                    tzinfo=timezone.utc
-                )
+            # Skip articles without a usable publication date.
+            if not published_time:
+                continue
 
-                if published >= cutoff_time:
-                    recent_articles.append(article)
+            published = datetime(
+                *published_time[:6],
+                tzinfo=timezone.utc
+            )
 
-        print(f"\nFound {len(recent_articles)} articles from the last 24 hours")
+            # Skip anything older than 24 hours.
+            if published < cutoff_time:
+                continue
 
-        for article in recent_articles[:5]:
-            title = article.get("title", "No title")
-            link = article.get("link", "No link")
+            story = {
+                "source": name,
+                "title": article.get("title", "No title"),
+                "link": article.get("link", "No link"),
+                "published": published
+            }
 
-            published_time = article.get("published_parsed")
+            all_stories.append(story)
+            source_count += 1
 
-            if published_time:
-                published = datetime(
-                    *published_time[:6],
-                    tzinfo=timezone.utc
-                )
-                published_display = published.strftime("%Y-%m-%d %H:%M UTC")
-            else:
-                published_display = "Unknown date"
-
-            print(published_display)
-            print(title)
-            print(link)
-            print()
+        print(f"Found {source_count} recent articles")
 
     except Exception as error:
         print("Could not retrieve this feed. Skipping it.")
         print(f"Error: {error}")
         continue
+
+
+# Sort everything by publication time, newest first.
+all_stories.sort(
+    key=lambda story: story["published"],
+    reverse=True
+)
+
+print("\n\nALL RECENT STORIES")
+print("=" * 50)
+
+print(f"Total stories collected: {len(all_stories)}")
+
+for story in all_stories:
+    print(
+        f"\n{story['published'].strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    print(f"{story['source']}: {story['title']}")
+    print(story["link"])
