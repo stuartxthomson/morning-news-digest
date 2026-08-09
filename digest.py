@@ -2,7 +2,9 @@ import feedparser
 import socket
 import os
 import smtplib
+import html
 
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
@@ -13,7 +15,7 @@ from sources import FEEDS
 socket.setdefaulttimeout(10)
 
 
-# Get our Gmail credentials from GitHub Secrets.
+# Get Gmail credentials from GitHub Secrets.
 email_address = os.environ["EMAIL_ADDRESS"]
 app_password = os.environ["EMAIL_APP_PASSWORD"]
 
@@ -22,7 +24,7 @@ app_password = os.environ["EMAIL_APP_PASSWORD"]
 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 
 
-# This will hold all recent stories.
+# Store all stories here.
 all_stories = []
 
 
@@ -58,12 +60,16 @@ def classify_story(title):
     return "news"
 
 
-# Collect stories from every feed.
+# ---------------------------------------------------------
+# COLLECT STORIES
+# ---------------------------------------------------------
+
 for name, url in FEEDS.items():
 
     print(f"Checking {name}...")
 
     try:
+
         feed = feedparser.parse(url)
 
         if feed.bozo and not feed.entries:
@@ -88,12 +94,17 @@ for name, url in FEEDS.items():
             title = article.get("title", "No title")
             link = article.get("link", "")
 
+            category = classify_story(title)
+
+            # For the MVP, only include regular news stories.
+            if category != "news":
+                continue
+
             story = {
                 "source": name,
                 "title": title,
                 "link": link,
-                "published": published,
-                "category": classify_story(title)
+                "published": published
             }
 
             all_stories.append(story)
@@ -104,65 +115,199 @@ for name, url in FEEDS.items():
         print(f"Error: {error}")
 
 
-# Sort newest first.
-all_stories.sort(
-    key=lambda story: story["published"],
-    reverse=True
-)
+# ---------------------------------------------------------
+# GROUP STORIES BY SOURCE
+# ---------------------------------------------------------
+
+stories_by_source = defaultdict(list)
+
+for story in all_stories:
+    stories_by_source[story["source"]].append(story)
 
 
-# Build the email.
-message = EmailMessage()
+# Sort each publication's stories newest first.
+for source in stories_by_source:
+
+    stories_by_source[source].sort(
+        key=lambda story: story["published"],
+        reverse=True
+    )
+
+
+# ---------------------------------------------------------
+# BUILD THE EMAIL
+# ---------------------------------------------------------
 
 today = datetime.now().strftime("%B %-d, %Y")
+
+message = EmailMessage()
 
 message["Subject"] = f"Morning News Digest — {today}"
 message["From"] = email_address
 message["To"] = email_address
 
 
-# Plain-text version of the email.
+# ---------------------------------------------------------
+# PLAIN-TEXT VERSION
+# ---------------------------------------------------------
+
 text_lines = []
 
 text_lines.append("MORNING NEWS DIGEST")
+text_lines.append(today)
 text_lines.append("")
 text_lines.append(
-    f"Stories from the last 30 hours: {len(all_stories)}"
+    f"{len(all_stories)} news stories from the last 30 hours."
 )
 text_lines.append("")
 
 
-current_source = None
-
-for story in all_stories:
-
-    if story["source"] != current_source:
-
-        current_source = story["source"]
-
-        text_lines.append("")
-        text_lines.append(current_source.upper())
-        text_lines.append("-" * len(current_source))
-
-    published = story["published"].strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
-
-    text_lines.append(
-        f"{published} — {story['title']}"
-    )
-
-    text_lines.append(
-        story["link"]
-    )
+# Sort publications alphabetically.
+for source in sorted(stories_by_source):
 
     text_lines.append("")
+    text_lines.append(source.upper())
+    text_lines.append("=" * len(source))
+
+    for story in stories_by_source[source]:
+
+        text_lines.append("")
+        text_lines.append(f"• {story['title']}")
+        text_lines.append(story["link"])
 
 
-message.set_content("\n".join(text_lines))
+plain_text = "\n".join(text_lines)
 
 
-# Send the email through Gmail.
+# ---------------------------------------------------------
+# HTML VERSION
+# ---------------------------------------------------------
+
+html_parts = []
+
+html_parts.append("""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    color: #222222;
+    background-color: #ffffff;
+    margin: 0;
+    padding: 0;
+}
+
+.container {
+    max-width: 700px;
+    margin: 0 auto;
+    padding: 30px 20px;
+}
+
+h1 {
+    font-size: 28px;
+    margin-bottom: 5px;
+}
+
+.date {
+    color: #666666;
+    margin-bottom: 30px;
+}
+
+.source {
+    font-size: 20px;
+    font-weight: bold;
+    border-bottom: 2px solid #222222;
+    padding-bottom: 6px;
+    margin-top: 30px;
+    margin-bottom: 12px;
+}
+
+.story {
+    margin-bottom: 14px;
+}
+
+.story a {
+    color: #174a8b;
+    text-decoration: none;
+    font-size: 16px;
+    line-height: 1.4;
+}
+
+.story a:hover {
+    text-decoration: underline;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>Morning News Digest</h1>
+
+<div class="date">
+""")
+
+html_parts.append(html.escape(today))
+
+html_parts.append("""
+</div>
+""")
+
+html_parts.append(
+    f"<p>{len(all_stories)} news stories from the last 30 hours.</p>"
+)
+
+
+# Add each publication.
+for source in sorted(stories_by_source):
+
+    html_parts.append(
+        f'<div class="source">{html.escape(source)}</div>'
+    )
+
+    for story in stories_by_source[source]:
+
+        title = html.escape(story["title"])
+        link = html.escape(story["link"], quote=True)
+
+        html_parts.append(
+            f'''
+            <div class="story">
+                <a href="{link}">{title}</a>
+            </div>
+            '''
+        )
+
+
+html_parts.append("""
+</div>
+
+</body>
+</html>
+""")
+
+
+html_body = "".join(html_parts)
+
+
+# Attach both versions.
+message.set_content(plain_text)
+
+message.add_alternative(
+    html_body,
+    subtype="html"
+)
+
+
+# ---------------------------------------------------------
+# SEND EMAIL
+# ---------------------------------------------------------
+
 with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
 
     smtp.login(email_address, app_password)
@@ -172,5 +317,5 @@ with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
 
 print(
     f"Digest sent successfully! "
-    f"{len(all_stories)} stories included."
+    f"{len(all_stories)} news stories included."
 )
