@@ -20,4 +20,7 @@ jobs:
         run: pip install feedparser
 
       - name: Run my Python program
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
         run: python digest.py
