@@ -3,6 +3,8 @@ import socket
 import os
 import smtplib
 import html
+import urllib.request
+import xml.etree.ElementTree as ET
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -24,7 +26,209 @@ app_password = os.environ["EMAIL_APP_PASSWORD"]
 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 
 
-# Store all stories here.
+# ---------------------------------------------------------
+# OTTAWA WEATHER
+# ---------------------------------------------------------
+
+def get_ottawa_weather():
+    """
+    Get Ottawa's 7 a.m. forecast and today's forecast
+    from Environment Canada.
+
+    Returns:
+        {
+            "morning_temp": "18°C",
+            "morning_condition": "Mainly sunny",
+            "high": "27°C",
+            "forecast": "Mainly sunny"
+        }
+
+    Returns None if the weather service cannot be reached.
+    """
+
+    weather_url = (
+        "https://weather.gc.ca/rss/hourly/on-118_metric_e.xml"
+    )
+
+    try:
+
+        request = urllib.request.Request(
+            weather_url,
+            headers={
+                "User-Agent": "Morning News Digest"
+            }
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=10
+        ) as response:
+
+            data = response.read()
+
+        root = ET.fromstring(data)
+
+        items = root.findall(".//item")
+
+        today = datetime.now().date()
+
+        morning_temp = None
+        morning_condition = None
+        daily_high = None
+        daily_forecast = None
+
+        for item in items:
+
+            title_element = item.find("title")
+
+            if title_element is None:
+                continue
+
+            title = title_element.text or ""
+
+            description_element = item.find("description")
+
+            if description_element is None:
+                continue
+
+            description = description_element.text or ""
+
+            # Look for the 7 a.m. forecast.
+            if "07:00" in title or "7:00" in title:
+
+                morning_temp = extract_temperature(
+                    title,
+                    description
+                )
+
+                morning_condition = extract_condition(
+                    title,
+                    description
+                )
+
+            # Look for today's daily forecast.
+            if (
+                "Today" in title
+                or "Today" in description
+            ):
+
+                daily_high = extract_high(
+                    title,
+                    description
+                )
+
+                daily_forecast = extract_condition(
+                    title,
+                    description
+                )
+
+        # If we couldn't find the required information,
+        # return None so the news digest still works.
+        if not morning_temp:
+            return None
+
+        return {
+            "morning_temp": morning_temp,
+            "morning_condition": morning_condition or "Forecast unavailable",
+            "high": daily_high or "N/A",
+            "forecast": daily_forecast or morning_condition or "Forecast unavailable"
+        }
+
+    except Exception as error:
+
+        print("Could not retrieve Ottawa weather.")
+        print(f"Error: {error}")
+
+        return None
+
+
+def extract_temperature(title, description):
+    """Extract a temperature from Environment Canada's feed."""
+
+    text = f"{title} {description}"
+
+    import re
+
+    match = re.search(
+        r"(-?\d+)\s*°?C",
+        text
+    )
+
+    if match:
+        return f"{match.group(1)}°C"
+
+    return None
+
+
+def extract_high(title, description):
+    """Extract today's high temperature."""
+
+    text = f"{title} {description}"
+
+    import re
+
+    patterns = [
+        r"High\s+(-?\d+)\s*°?C",
+        r"high of\s+(-?\d+)\s*°?C",
+        r"(-?\d+)\s*°?C.*high"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+            return f"{match.group(1)}°C"
+
+    return None
+
+
+def extract_condition(title, description):
+    """Extract the weather condition."""
+
+    text = f"{title} {description}"
+
+    common_conditions = [
+        "A mix of sun and cloud",
+        "Mainly sunny",
+        "Sunny",
+        "Partly cloudy",
+        "Mostly cloudy",
+        "Cloudy",
+        "Clear",
+        "A few clouds",
+        "A few showers",
+        "Showers",
+        "Light rain",
+        "Rain",
+        "Chance of showers",
+        "Chance of rain",
+        "Periods of rain",
+        "Thunderstorms",
+        "Snow",
+        "Chance of flurries",
+        "Flurries"
+    ]
+
+    for condition in common_conditions:
+
+        if condition.lower() in text.lower():
+            return condition
+
+    return None
+
+
+weather = get_ottawa_weather()
+
+
+# ---------------------------------------------------------
+# COLLECT NEWS STORIES
+# ---------------------------------------------------------
+
 all_stories = []
 
 
@@ -60,10 +264,6 @@ def classify_story(title):
     return "news"
 
 
-# ---------------------------------------------------------
-# COLLECT STORIES
-# ---------------------------------------------------------
-
 for name, url in FEEDS.items():
 
     print(f"Checking {name}...")
@@ -91,27 +291,36 @@ for name, url in FEEDS.items():
             if published < cutoff_time:
                 continue
 
-            title = article.get("title", "No title")
-            link = article.get("link", "")
+            title = article.get(
+                "title",
+                "No title"
+            )
+
+            link = article.get(
+                "link",
+                ""
+            )
 
             category = classify_story(title)
 
-            # For the MVP, only include regular news stories.
+            # MVP: only include regular news.
             if category != "news":
                 continue
 
-            story = {
+            all_stories.append({
                 "source": name,
                 "title": title,
                 "link": link,
                 "published": published
-            }
-
-            all_stories.append(story)
+            })
 
     except Exception as error:
 
-        print(f"Could not retrieve {name}. Skipping it.")
+        print(
+            f"Could not retrieve {name}. "
+            f"Skipping it."
+        )
+
         print(f"Error: {error}")
 
 
@@ -122,10 +331,12 @@ for name, url in FEEDS.items():
 stories_by_source = defaultdict(list)
 
 for story in all_stories:
-    stories_by_source[story["source"]].append(story)
+
+    stories_by_source[
+        story["source"]
+    ].append(story)
 
 
-# Sort each publication's stories newest first.
 for source in stories_by_source:
 
     stories_by_source[source].sort(
@@ -135,48 +346,93 @@ for source in stories_by_source:
 
 
 # ---------------------------------------------------------
-# BUILD THE EMAIL
+# BUILD EMAIL
 # ---------------------------------------------------------
 
-today = datetime.now().strftime("%B %-d, %Y")
+today = datetime.now().strftime(
+    "%B %-d, %Y"
+)
 
 message = EmailMessage()
 
-message["Subject"] = f"Morning News Digest — {today}"
+message["Subject"] = (
+    f"Morning News Digest — {today}"
+)
+
 message["From"] = email_address
 message["To"] = email_address
 
 
 # ---------------------------------------------------------
-# PLAIN-TEXT VERSION
+# PLAIN TEXT VERSION
 # ---------------------------------------------------------
 
 text_lines = []
 
-text_lines.append("MORNING NEWS DIGEST")
-text_lines.append(today)
-text_lines.append("")
 text_lines.append(
-    f"{len(all_stories)} news stories from the last 30 hours."
+    "MORNING NEWS DIGEST"
 )
+
+text_lines.append(today)
+
 text_lines.append("")
 
 
-# Sort publications alphabetically.
+# Weather block.
+if weather:
+
+    text_lines.append(
+        "OTTAWA WEATHER"
+    )
+
+    text_lines.append(
+        f"🌡️ {weather['morning_temp']} at 7 a.m."
+    )
+
+    text_lines.append(
+        f"☀️ Today's forecast: "
+        f"{weather['high']} — "
+        f"{weather['forecast']}"
+    )
+
+    text_lines.append("")
+
+
+text_lines.append(
+    f"{len(all_stories)} news stories "
+    f"from the last 30 hours."
+)
+
+text_lines.append("")
+
+
 for source in sorted(stories_by_source):
 
     text_lines.append("")
-    text_lines.append(source.upper())
-    text_lines.append("=" * len(source))
+    text_lines.append(
+        source.upper()
+    )
+
+    text_lines.append(
+        "=" * len(source)
+    )
 
     for story in stories_by_source[source]:
 
         text_lines.append("")
-        text_lines.append(f"• {story['title']}")
-        text_lines.append(story["link"])
+
+        text_lines.append(
+            f"• {story['title']}"
+        )
+
+        text_lines.append(
+            story["link"]
+        )
 
 
-plain_text = "\n".join(text_lines)
+plain_text = "\n".join(
+    text_lines
+)
 
 
 # ---------------------------------------------------------
@@ -190,6 +446,7 @@ html_parts.append("""
 <html>
 <head>
 <meta charset="UTF-8">
+
 <style>
 
 body {
@@ -213,7 +470,26 @@ h1 {
 
 .date {
     color: #666666;
-    margin-bottom: 30px;
+    margin-bottom: 25px;
+}
+
+.weather {
+    background-color: #f5f7f9;
+    padding: 15px 18px;
+    border-radius: 6px;
+    margin-bottom: 25px;
+}
+
+.weather-title {
+    font-size: 14px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+}
+
+.weather-line {
+    font-size: 16px;
+    margin: 5px 0;
 }
 
 .source {
@@ -252,35 +528,80 @@ h1 {
 <div class="date">
 """)
 
-html_parts.append(html.escape(today))
-
-html_parts.append("""
-</div>
-""")
+html_parts.append(
+    html.escape(today)
+)
 
 html_parts.append(
-    f"<p>{len(all_stories)} news stories from the last 30 hours.</p>"
+    "</div>"
 )
 
 
-# Add each publication.
+# Weather HTML.
+if weather:
+
+    html_parts.append(
+        f"""
+        <div class="weather">
+
+            <div class="weather-title">
+                OTTAWA WEATHER
+            </div>
+
+            <div class="weather-line">
+                🌡️ <strong>
+                {html.escape(weather['morning_temp'])}
+                at 7 a.m.
+                </strong>
+            </div>
+
+            <div class="weather-line">
+                ☀️ Today's forecast:
+                <strong>
+                {html.escape(weather['high'])}
+                </strong>
+                — {html.escape(weather['forecast'])}
+            </div>
+
+        </div>
+        """
+    )
+
+
+html_parts.append(
+    f"<p>{len(all_stories)} news stories "
+    f"from the last 30 hours.</p>"
+)
+
+
+# News stories.
 for source in sorted(stories_by_source):
 
     html_parts.append(
-        f'<div class="source">{html.escape(source)}</div>'
+        f'<div class="source">'
+        f'{html.escape(source)}'
+        f'</div>'
     )
 
     for story in stories_by_source[source]:
 
-        title = html.escape(story["title"])
-        link = html.escape(story["link"], quote=True)
+        title = html.escape(
+            story["title"]
+        )
+
+        link = html.escape(
+            story["link"],
+            quote=True
+        )
 
         html_parts.append(
-            f'''
+            f"""
             <div class="story">
-                <a href="{link}">{title}</a>
+                <a href="{link}">
+                    {title}
+                </a>
             </div>
-            '''
+            """
         )
 
 
@@ -292,11 +613,15 @@ html_parts.append("""
 """)
 
 
-html_body = "".join(html_parts)
+html_body = "".join(
+    html_parts
+)
 
 
 # Attach both versions.
-message.set_content(plain_text)
+message.set_content(
+    plain_text
+)
 
 message.add_alternative(
     html_body,
@@ -308,11 +633,19 @@ message.add_alternative(
 # SEND EMAIL
 # ---------------------------------------------------------
 
-with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+with smtplib.SMTP_SSL(
+    "smtp.gmail.com",
+    465
+) as smtp:
 
-    smtp.login(email_address, app_password)
+    smtp.login(
+        email_address,
+        app_password
+    )
 
-    smtp.send_message(message)
+    smtp.send_message(
+        message
+    )
 
 
 print(
