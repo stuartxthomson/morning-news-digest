@@ -199,6 +199,7 @@ def get_ottawa_weather():
 
         return None
 
+weather = get_ottawa_weather()
 
 # ---------------------------------------------------------
 # COLLECT NEWS STORIES
