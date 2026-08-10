@@ -32,15 +32,19 @@ cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 
 def get_ottawa_weather():
     """
-    Get Ottawa's 7 a.m. forecast and today's forecast
-    from Environment Canada's current hourly forecast page.
+    Get Ottawa's 7 a.m. forecast from Open-Meteo.
 
-    Returns None if the weather service cannot be reached.
+    No API key or account is required.
     """
 
     weather_url = (
-        "https://weather.gc.ca/en/forecast/hourly/index.html"
-        "?coords=45.4215,-75.6972"
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=45.4215"
+        "&longitude=-75.6972"
+        "&hourly=temperature_2m,weather_code"
+        "&daily=temperature_2m_max"
+        "&timezone=America%2FToronto"
+        "&forecast_days=1"
     )
 
     try:
@@ -48,10 +52,7 @@ def get_ottawa_weather():
         request = urllib.request.Request(
             weather_url,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(compatible; MorningNewsDigest/1.0)"
-                )
+                "User-Agent": "Morning News Digest"
             }
         )
 
@@ -60,136 +61,85 @@ def get_ottawa_weather():
             timeout=10
         ) as response:
 
-            page = response.read().decode("utf-8")
+            data = response.read().decode("utf-8")
 
-        # Environment Canada's current page contains
-        # structured JSON-LD data that we can use.
-        import re
         import json
 
-        json_blocks = re.findall(
-            r'<script[^>]*type="application/ld\+json"[^>]*>'
-            r'(.*?)'
-            r'</script>',
-            page,
-            re.DOTALL | re.IGNORECASE
-        )
+        weather_data = json.loads(data)
 
-        forecast_data = None
+        hourly = weather_data["hourly"]
+        daily = weather_data["daily"]
 
-        for block in json_blocks:
+        # Find the 7 a.m. forecast.
+        morning_index = None
 
-            try:
+        for i, time in enumerate(hourly["time"]):
 
-                data = json.loads(block.strip())
+            if time.endswith("T07:00"):
+                morning_index = i
+                break
 
-                if isinstance(data, dict):
-                    forecast_data = data
-                    break
+        if morning_index is None:
 
-            except json.JSONDecodeError:
-                continue
-
-        if not forecast_data:
             print(
-                "Could not find structured weather data."
-            )
-            return None
-
-        # The Environment Canada page structure can change,
-        # so search the page text for the information we need.
-        text = re.sub(
-            r"<[^>]+>",
-            " ",
-            page
-        )
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            text
-        )
-
-        # Look for temperatures associated with 7 a.m.
-        morning_match = re.search(
-            r"7\s*:\s*00\s*a\.?m\.?.{0,300}?"
-            r"(-?\d+)\s*°?\s*C",
-            text,
-            re.IGNORECASE
-        )
-
-        if not morning_match:
-
-            morning_match = re.search(
-                r"7\s*a\.?m\.?.{0,300}?"
-                r"(-?\d+)\s*°?\s*C",
-                text,
-                re.IGNORECASE
+                "Could not find Ottawa's 7 a.m. forecast."
             )
 
-        if not morning_match:
-            print(
-                "Could not find Ottawa's 7 a.m. temperature."
-            )
             return None
 
         morning_temp = (
-            f"{morning_match.group(1)}°C"
+            hourly["temperature_2m"][morning_index]
         )
 
-        # Look for today's high.
-        high_match = re.search(
-            r"(?:High|high)\s*"
-            r"(-?\d+)\s*°?\s*C",
-            text
+        weather_code = (
+            hourly["weather_code"][morning_index]
         )
 
-        daily_high = (
-            f"{high_match.group(1)}°C"
-            if high_match
-            else "N/A"
+        daily_high = daily["temperature_2m_max"][0]
+
+        # Convert Open-Meteo weather codes into
+        # simple descriptions.
+        weather_descriptions = {
+
+            0: "Clear",
+            1: "Mainly sunny",
+            2: "Partly cloudy",
+            3: "Cloudy",
+
+            45: "Foggy",
+            48: "Foggy",
+
+            51: "Light drizzle",
+            53: "Drizzle",
+            55: "Heavy drizzle",
+
+            61: "Light rain",
+            63: "Rain",
+            65: "Heavy rain",
+
+            71: "Light snow",
+            73: "Snow",
+            75: "Heavy snow",
+
+            80: "Light showers",
+            81: "Showers",
+            82: "Heavy showers",
+
+            95: "Thunderstorms",
+            96: "Thunderstorms",
+            99: "Thunderstorms"
+        }
+
+        condition = weather_descriptions.get(
+            weather_code,
+            "Forecast unavailable"
         )
-
-        # Try to identify the forecast description.
-        conditions = [
-            "Mainly sunny",
-            "A mix of sun and cloud",
-            "Sunny",
-            "Partly cloudy",
-            "Mostly cloudy",
-            "Cloudy",
-            "Clear",
-            "A few clouds",
-            "A few showers",
-            "Showers",
-            "Light rain",
-            "Rain",
-            "Chance of showers",
-            "Chance of rain",
-            "Periods of rain",
-            "Thunderstorms",
-            "Snow",
-            "Chance of flurries",
-            "Flurries"
-        ]
-
-        daily_forecast = None
-
-        for condition in conditions:
-
-            if condition.lower() in text.lower():
-
-                daily_forecast = condition
-                break
-
-        if not daily_forecast:
-            daily_forecast = "Forecast unavailable"
 
         return {
-            "morning_temp": morning_temp,
-            "morning_condition": daily_forecast,
-            "high": daily_high,
-            "forecast": daily_forecast
+            "morning_temp": f"{round(morning_temp)}°C",
+            "morning_condition": condition,
+            "high": f"{round(daily_high)}°C",
+            "forecast": condition
         }
 
     except Exception as error:
