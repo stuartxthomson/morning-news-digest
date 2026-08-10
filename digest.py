@@ -33,21 +33,14 @@ cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 def get_ottawa_weather():
     """
     Get Ottawa's 7 a.m. forecast and today's forecast
-    from Environment Canada.
-
-    Returns:
-        {
-            "morning_temp": "18°C",
-            "morning_condition": "Mainly sunny",
-            "high": "27°C",
-            "forecast": "Mainly sunny"
-        }
+    from Environment Canada's current hourly forecast page.
 
     Returns None if the weather service cannot be reached.
     """
 
     weather_url = (
-        "https://weather.gc.ca/rss/hourly/on-118_metric_e.xml"
+        "https://weather.gc.ca/en/forecast/hourly/index.html"
+        "?coords=45.4215,-75.6972"
     )
 
     try:
@@ -55,7 +48,10 @@ def get_ottawa_weather():
         request = urllib.request.Request(
             weather_url,
             headers={
-                "User-Agent": "Morning News Digest"
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; MorningNewsDigest/1.0)"
+                )
             }
         )
 
@@ -64,74 +60,136 @@ def get_ottawa_weather():
             timeout=10
         ) as response:
 
-            data = response.read()
+            page = response.read().decode("utf-8")
 
-        root = ET.fromstring(data)
+        # Environment Canada's current page contains
+        # structured JSON-LD data that we can use.
+        import re
+        import json
 
-        items = root.findall(".//item")
+        json_blocks = re.findall(
+            r'<script[^>]*type="application/ld\+json"[^>]*>'
+            r'(.*?)'
+            r'</script>',
+            page,
+            re.DOTALL | re.IGNORECASE
+        )
 
-        today = datetime.now().date()
+        forecast_data = None
 
-        morning_temp = None
-        morning_condition = None
-        daily_high = None
+        for block in json_blocks:
+
+            try:
+
+                data = json.loads(block.strip())
+
+                if isinstance(data, dict):
+                    forecast_data = data
+                    break
+
+            except json.JSONDecodeError:
+                continue
+
+        if not forecast_data:
+            print(
+                "Could not find structured weather data."
+            )
+            return None
+
+        # The Environment Canada page structure can change,
+        # so search the page text for the information we need.
+        text = re.sub(
+            r"<[^>]+>",
+            " ",
+            page
+        )
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text
+        )
+
+        # Look for temperatures associated with 7 a.m.
+        morning_match = re.search(
+            r"7\s*:\s*00\s*a\.?m\.?.{0,300}?"
+            r"(-?\d+)\s*°?\s*C",
+            text,
+            re.IGNORECASE
+        )
+
+        if not morning_match:
+
+            morning_match = re.search(
+                r"7\s*a\.?m\.?.{0,300}?"
+                r"(-?\d+)\s*°?\s*C",
+                text,
+                re.IGNORECASE
+            )
+
+        if not morning_match:
+            print(
+                "Could not find Ottawa's 7 a.m. temperature."
+            )
+            return None
+
+        morning_temp = (
+            f"{morning_match.group(1)}°C"
+        )
+
+        # Look for today's high.
+        high_match = re.search(
+            r"(?:High|high)\s*"
+            r"(-?\d+)\s*°?\s*C",
+            text
+        )
+
+        daily_high = (
+            f"{high_match.group(1)}°C"
+            if high_match
+            else "N/A"
+        )
+
+        # Try to identify the forecast description.
+        conditions = [
+            "Mainly sunny",
+            "A mix of sun and cloud",
+            "Sunny",
+            "Partly cloudy",
+            "Mostly cloudy",
+            "Cloudy",
+            "Clear",
+            "A few clouds",
+            "A few showers",
+            "Showers",
+            "Light rain",
+            "Rain",
+            "Chance of showers",
+            "Chance of rain",
+            "Periods of rain",
+            "Thunderstorms",
+            "Snow",
+            "Chance of flurries",
+            "Flurries"
+        ]
+
         daily_forecast = None
 
-        for item in items:
+        for condition in conditions:
 
-            title_element = item.find("title")
+            if condition.lower() in text.lower():
 
-            if title_element is None:
-                continue
+                daily_forecast = condition
+                break
 
-            title = title_element.text or ""
-
-            description_element = item.find("description")
-
-            if description_element is None:
-                continue
-
-            description = description_element.text or ""
-
-            # Look for the 7 a.m. forecast.
-            if "07:00" in title or "7:00" in title:
-
-                morning_temp = extract_temperature(
-                    title,
-                    description
-                )
-
-                morning_condition = extract_condition(
-                    title,
-                    description
-                )
-
-            # Look for today's daily forecast.
-            if (
-                "Today" in title
-                or "Today" in description
-            ):
-
-                daily_high = extract_high(
-                    title,
-                    description
-                )
-
-                daily_forecast = extract_condition(
-                    title,
-                    description
-                )
-
-        # If we couldn't find the required information,
-        # return None so the news digest still works.
-        if not morning_temp:
-            return None
+        if not daily_forecast:
+            daily_forecast = "Forecast unavailable"
 
         return {
             "morning_temp": morning_temp,
-            "morning_condition": morning_condition or "Forecast unavailable",
-            "high": daily_high or "N/A",
-            "forecast": daily_forecast or morning_condition or "Forecast unavailable"
+            "morning_condition": daily_forecast,
+            "high": daily_high,
+            "forecast": daily_forecast
         }
 
     except Exception as error:
@@ -140,89 +198,6 @@ def get_ottawa_weather():
         print(f"Error: {error}")
 
         return None
-
-
-def extract_temperature(title, description):
-    """Extract a temperature from Environment Canada's feed."""
-
-    text = f"{title} {description}"
-
-    import re
-
-    match = re.search(
-        r"(-?\d+)\s*°?C",
-        text
-    )
-
-    if match:
-        return f"{match.group(1)}°C"
-
-    return None
-
-
-def extract_high(title, description):
-    """Extract today's high temperature."""
-
-    text = f"{title} {description}"
-
-    import re
-
-    patterns = [
-        r"High\s+(-?\d+)\s*°?C",
-        r"high of\s+(-?\d+)\s*°?C",
-        r"(-?\d+)\s*°?C.*high"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return f"{match.group(1)}°C"
-
-    return None
-
-
-def extract_condition(title, description):
-    """Extract the weather condition."""
-
-    text = f"{title} {description}"
-
-    common_conditions = [
-        "A mix of sun and cloud",
-        "Mainly sunny",
-        "Sunny",
-        "Partly cloudy",
-        "Mostly cloudy",
-        "Cloudy",
-        "Clear",
-        "A few clouds",
-        "A few showers",
-        "Showers",
-        "Light rain",
-        "Rain",
-        "Chance of showers",
-        "Chance of rain",
-        "Periods of rain",
-        "Thunderstorms",
-        "Snow",
-        "Chance of flurries",
-        "Flurries"
-    ]
-
-    for condition in common_conditions:
-
-        if condition.lower() in text.lower():
-            return condition
-
-    return None
-
-
-weather = get_ottawa_weather()
 
 
 # ---------------------------------------------------------
