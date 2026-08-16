@@ -27,11 +27,12 @@ def get_tomorrow_date():
 
 
 def get_committees():
+
     tomorrow = get_tomorrow_date()
 
     print()
     print("=" * 60)
-    print(f"COMMITTEE MEETINGS FOR {tomorrow}")
+    print(f"LOOKING FOR MEETINGS ON {tomorrow}")
     print("=" * 60)
     print()
 
@@ -39,57 +40,71 @@ def get_committees():
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Look for the meeting entries on the House page.
-    meeting_links = soup.find_all("a")
+    # Find all meeting containers on the page.
+    meeting_blocks = soup.select(
+        "[id^='collapse-meeting-']"
+    )
+
+    print(
+        f"Found {len(meeting_blocks)} meeting blocks on the page."
+    )
+    print()
 
     found = 0
 
-    for link in meeting_links:
+    for block in meeting_blocks:
 
-        text = link.get_text(" ", strip=True)
+        text = block.get_text(" ", strip=True)
 
-        if not text:
-            continue
+        # -----------------------------------------------------
+        # DATE CHECK
+        # -----------------------------------------------------
+        #
+        # The House page uses "Tomorrow" for tomorrow's meetings.
+        # We only want those meetings.
+        #
 
-        # We are looking for links containing meeting times.
-        if "a.m." not in text and "p.m." not in text:
-            continue
-
-        # Try to identify committee meeting links.
-        if not any(
-            committee in text
-            for committee in [
-                "FINA", "SECU", "ETHI", "OGGO", "PROC",
-                "JUST", "INDU", "TRAN", "HESA", "CIMM",
-                "ENVI", "FAAE", "NDDN", "PACP", "FOPO",
-                "CHPC", "AGRI", "FEWO", "HUMA", "INAN",
-                "LANG", "RNNR", "SRSR", "ACVA", "CIIT"
-            ]
-        ):
+        if "Tomorrow" not in text:
             continue
 
         found += 1
 
-        print("MEETING")
-        print("-" * 60)
+        print("=" * 60)
+        print("MATCHING MEETING")
+        print("=" * 60)
+
+        print()
         print(text)
 
-        meeting_url = urljoin(MEETINGS_URL, link.get("href", ""))
+        # Look for links inside this specific meeting block.
+        links = block.find_all("a")
 
         print()
-        print("Meeting page:")
-        print(meeting_url)
+        print("LINKS FOUND:")
+
+        for link in links:
+
+            link_text = link.get_text(" ", strip=True)
+
+            href = link.get("href")
+
+            if not href:
+                continue
+
+            full_url = urljoin(
+                MEETINGS_URL,
+                href
+            )
+
+            print()
+            print(f"{link_text}")
+            print(full_url)
+
         print()
 
-    if found == 0:
-        print("No meetings were found.")
-        print()
-        print(
-            "The House website may have changed its page structure."
-        )
-
-    print()
-    print(f"Meetings found: {found}")
+    print("=" * 60)
+    print(f"MEETINGS FOR TOMORROW FOUND: {found}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
