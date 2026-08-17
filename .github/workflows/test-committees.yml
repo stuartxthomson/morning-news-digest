@@ -19,5 +19,5 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run committee scraper
+      - name: Run committee test
         run: python committees_test.py
