@@ -4,11 +4,16 @@ import os
 import smtplib
 import html
 import urllib.request
-import xml.etree.ElementTree as ET
+import json
+import requests
+import re
 
+from bs4 import BeautifulSoup
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
+from urllib.parse import urljoin
 
 from sources import FEEDS
 
@@ -33,8 +38,6 @@ cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 def get_ottawa_weather():
     """
     Get Ottawa's 7 a.m. forecast from Open-Meteo.
-
-    No API key or account is required.
     """
 
     weather_url = (
@@ -63,14 +66,11 @@ def get_ottawa_weather():
 
             data = response.read().decode("utf-8")
 
-        import json
-
         weather_data = json.loads(data)
 
         hourly = weather_data["hourly"]
         daily = weather_data["daily"]
 
-        # Find the 7 a.m. forecast.
         morning_index = None
 
         for i, time in enumerate(hourly["time"]):
@@ -97,8 +97,6 @@ def get_ottawa_weather():
 
         daily_high = daily["temperature_2m_max"][0]
 
-        # Convert Open-Meteo weather codes into
-        # simple descriptions.
         weather_descriptions = {
 
             0: "Clear",
@@ -149,7 +147,604 @@ def get_ottawa_weather():
 
         return None
 
+
 weather = get_ottawa_weather()
+
+
+# ---------------------------------------------------------
+# HOUSE OF COMMONS COMMITTEE MEETINGS
+# ---------------------------------------------------------
+
+BASE_URL = "https://www.ourcommons.ca"
+MEETINGS_URL = (
+    "https://www.ourcommons.ca/committees/en/Meetings"
+)
+
+
+def clean_text(text):
+    """Clean up whitespace in scraped text."""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+
+def get_committees_page(url):
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        )
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    return response.text
+
+
+def parse_committee_notice(notice_url):
+
+    try:
+
+        html_text = get_committees_page(
+            notice_url
+        )
+
+    except Exception as error:
+
+        print(
+            f"Could not retrieve committee notice: "
+            f"{error}"
+        )
+
+        return {
+            "date": "",
+            "time": "",
+            "location": "",
+            "televised": False,
+            "subject": "",
+            "witnesses": []
+        }
+
+    soup = BeautifulSoup(
+        html_text,
+        "html.parser"
+    )
+
+    text = soup.get_text(
+        "\n",
+        strip=True
+    )
+
+    lines = [
+        clean_text(line)
+        for line in text.splitlines()
+        if clean_text(line)
+    ]
+
+    date_value = ""
+
+    date_pattern = re.compile(
+        r"^(Monday|Tuesday|Wednesday|Thursday|Friday|"
+        r"Saturday|Sunday), "
+        r"(January|February|March|April|May|June|July|"
+        r"August|September|October|November|December) "
+        r"\d{1,2}, \d{4}$"
+    )
+
+    for line in lines:
+
+        if date_pattern.match(line):
+
+            date_value = line
+
+            break
+
+
+    time_value = ""
+
+    time_pattern = re.compile(
+        r"^\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.)\s*to\s*"
+        r"\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.)$",
+        re.IGNORECASE
+    )
+
+    for line in lines:
+
+        if time_pattern.match(line):
+
+            time_value = line
+
+            break
+
+
+    location_value = ""
+
+    for line in lines:
+
+        if (
+            "Building" in line
+            and (
+                "Room" in line
+                or "room" in line
+            )
+        ):
+
+            location_value = line
+
+            break
+
+
+    televised = any(
+        line.lower() == "televised"
+        for line in lines
+    )
+
+
+    # The subject appears immediately before
+    # "Committee clerk" on the notice.
+    subject = ""
+
+    clerk_index = None
+
+    for i, line in enumerate(lines):
+
+        if line.lower() == "committee clerk":
+
+            clerk_index = i
+
+            break
+
+
+    if clerk_index is not None:
+
+        candidates = []
+
+        for line in lines[:clerk_index]:
+
+            if len(line) > 50:
+
+                candidates.append(line)
+
+        if candidates:
+
+            subject = candidates[-1]
+
+
+    # -----------------------------------------------------
+    # WITNESSES
+    # -----------------------------------------------------
+
+    witnesses = []
+
+    witness_index = None
+
+    for i, line in enumerate(lines):
+
+        lower = line.lower()
+
+        if lower in (
+            "witnesses",
+            "witness",
+            "appearing",
+            "appearing before the committee"
+        ):
+
+            witness_index = i
+
+            break
+
+
+    if witness_index is not None:
+
+        for line in lines[witness_index + 1:]:
+
+            lower = line.lower()
+
+            if lower in (
+                "committee clerk",
+                "meeting agenda",
+                "agenda",
+                "notice of meeting"
+            ):
+
+                break
+
+            if len(line) < 3:
+                continue
+
+            if lower.startswith(
+                (
+                    "standing committee",
+                    "committee meeting",
+                    "notices of meeting"
+                )
+            ):
+
+                continue
+
+            witnesses.append(line)
+
+
+    cleaned_witnesses = []
+
+    for witness in witnesses:
+
+        if witness not in cleaned_witnesses:
+
+            cleaned_witnesses.append(
+                witness
+            )
+
+
+    return {
+        "date": date_value,
+        "time": time_value,
+        "location": location_value,
+        "televised": televised,
+        "subject": subject,
+        "witnesses": cleaned_witnesses
+    }
+
+
+def get_upcoming_committee_meetings():
+
+    try:
+
+        page_html = get_committees_page(
+            MEETINGS_URL
+        )
+
+    except Exception as error:
+
+        print(
+            f"Could not retrieve committee meetings: "
+            f"{error}"
+        )
+
+        return []
+
+
+    soup = BeautifulSoup(
+        page_html,
+        "html.parser"
+    )
+
+    meeting_blocks = soup.select(
+        "div.panel-collapse[id^='collapse-meeting-']"
+    )
+
+    print(
+        f"Found {len(meeting_blocks)} committee "
+        f"meeting blocks."
+    )
+
+
+    # Use Ottawa time, not GitHub runner time.
+    today = datetime.now(
+        ZoneInfo("America/Toronto")
+    ).date()
+
+
+    upcoming = []
+
+
+    for block in meeting_blocks:
+
+        # -----------------------------------------------------
+        # Ignore suspended meetings.
+        # -----------------------------------------------------
+
+        status = block.select_one(
+            ".meeting-card-meeting-status"
+        )
+
+        if status:
+
+            status_text = clean_text(
+                status.get_text(
+                    " ",
+                    strip=True
+                )
+            ).lower()
+
+            if "suspended" in status_text:
+
+                continue
+
+
+        # -----------------------------------------------------
+        # Committee name.
+        # -----------------------------------------------------
+
+        committee_link = block.select_one(
+            ".meeting-card-committee-details-name a"
+        )
+
+        if not committee_link:
+
+            continue
+
+        committee_name = clean_text(
+            committee_link.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+
+        # -----------------------------------------------------
+        # Date / time.
+        # -----------------------------------------------------
+
+        datetime_element = block.select_one(
+            ".meeting-card-attribute[id^='meeting-datetime-']"
+        )
+
+        if not datetime_element:
+
+            continue
+
+        datetime_text = clean_text(
+            datetime_element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+
+        meeting_date = None
+
+
+        date_match = re.search(
+            r"(January|February|March|April|May|June|July|"
+            r"August|September|October|November|December) "
+            r"\d{1,2}, \d{4}",
+            datetime_text,
+            re.IGNORECASE
+        )
+
+
+        if date_match:
+
+            try:
+
+                meeting_date = datetime.strptime(
+                    date_match.group(0),
+                    "%B %d, %Y"
+                ).date()
+
+            except ValueError:
+
+                pass
+
+
+        # -----------------------------------------------------
+        # Upcoming meetings sometimes say "Tomorrow"
+        # rather than giving the date.
+        # -----------------------------------------------------
+
+        if meeting_date is None:
+
+            for parent in block.parents:
+
+                if parent is None:
+
+                    break
+
+                text = clean_text(
+                    parent.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
+
+                if "Tomorrow" in text:
+
+                    meeting_date = (
+                        today + timedelta(days=1)
+                    )
+
+                    break
+
+
+        if meeting_date is None:
+
+            continue
+
+
+        if meeting_date < today:
+
+            continue
+
+
+        # -----------------------------------------------------
+        # Time.
+        # -----------------------------------------------------
+
+        time_text = datetime_text
+
+        if date_match:
+
+            time_text = (
+                time_text
+                .replace(
+                    date_match.group(0),
+                    ""
+                )
+                .strip()
+            )
+
+
+        # -----------------------------------------------------
+        # Location.
+        # -----------------------------------------------------
+
+        location_element = block.select_one(
+            ".meeting-location"
+        )
+
+        location = ""
+
+        if location_element:
+
+            location = clean_text(
+                location_element.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+
+        # -----------------------------------------------------
+        # Broadcast.
+        # -----------------------------------------------------
+
+        broadcast = ""
+
+        broadcast_element = block.select_one(
+            ".meeting-card-media-preview .stream-type"
+        )
+
+        if broadcast_element:
+
+            broadcast = clean_text(
+                broadcast_element.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+
+        # -----------------------------------------------------
+        # Studies / activities.
+        # -----------------------------------------------------
+
+        studies = []
+
+        for study in block.select(
+            ".meeting-card-studies-list "
+            ".meeting-card-study"
+        ):
+
+            study_text = clean_text(
+                study.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+            if study_text:
+
+                studies.append(
+                    study_text
+                )
+
+
+        # -----------------------------------------------------
+        # Notice link.
+        # -----------------------------------------------------
+
+        notice_link = block.select_one(
+            "a.btn-meeting-notice"
+        )
+
+        notice_url = ""
+
+        if (
+            notice_link
+            and notice_link.get("href")
+        ):
+
+            notice_url = urljoin(
+                BASE_URL,
+                notice_link["href"]
+            )
+
+
+        # -----------------------------------------------------
+        # Meeting page.
+        # -----------------------------------------------------
+
+        meeting_id = (
+            block.get("id", "")
+            .replace(
+                "collapse-meeting-",
+                ""
+            )
+        )
+
+        meeting_page = (
+            f"{MEETINGS_URL}"
+            f"#collapse-meeting-{meeting_id}"
+        )
+
+
+        meeting = {
+            "committee": committee_name,
+            "date": meeting_date,
+            "time": time_text,
+            "location": location,
+            "broadcast": broadcast,
+            "studies": studies,
+            "meeting_page": meeting_page,
+            "notice_url": notice_url
+        }
+
+
+        # -----------------------------------------------------
+        # Read Notice of Meeting.
+        # -----------------------------------------------------
+
+        if notice_url:
+
+            notice = parse_committee_notice(
+                notice_url
+            )
+
+            meeting["notice"] = notice
+
+        else:
+
+            meeting["notice"] = {
+                "date": "",
+                "time": "",
+                "location": "",
+                "televised": False,
+                "subject": "",
+                "witnesses": []
+            }
+
+
+        upcoming.append(
+            meeting
+        )
+
+
+    upcoming.sort(
+        key=lambda meeting: (
+            meeting["date"],
+            meeting["time"]
+        )
+    )
+
+
+    return upcoming
+
+
+committee_meetings = (
+    get_upcoming_committee_meetings()
+)
+
 
 # ---------------------------------------------------------
 # COLLECT NEWS STORIES
@@ -159,7 +754,6 @@ all_stories = []
 
 
 def classify_story(title):
-    """Give each story a simple category."""
 
     title_lower = title.lower()
 
@@ -168,7 +762,9 @@ def classify_story(title):
         "air fryer",
         "dorm-friendly"
     ]):
+
         return "lifestyle"
+
 
     if any(word in title_lower for word in [
         "letters:",
@@ -177,7 +773,9 @@ def classify_story(title):
         "column:",
         "view:"
     ]):
+
         return "opinion"
+
 
     if any(word in title_lower for word in [
         "podcast",
@@ -185,7 +783,9 @@ def classify_story(title):
         "gallery",
         "cartoonists"
     ]):
+
         return "feature"
+
 
     return "news"
 
@@ -199,39 +799,59 @@ for name, url in FEEDS.items():
         feed = feedparser.parse(url)
 
         if feed.bozo and not feed.entries:
-            print(f"Could not retrieve {name}. Skipping it.")
+
+            print(
+                f"Could not retrieve {name}. "
+                f"Skipping it."
+            )
+
             continue
+
 
         for article in feed.entries:
 
-            published_time = article.get("published_parsed")
+            published_time = article.get(
+                "published_parsed"
+            )
 
             if not published_time:
+
                 continue
+
 
             published = datetime(
                 *published_time[:6],
                 tzinfo=timezone.utc
             )
 
+
             if published < cutoff_time:
+
                 continue
+
 
             title = article.get(
                 "title",
                 "No title"
             )
 
+
             link = article.get(
                 "link",
                 ""
             )
 
-            category = classify_story(title)
+
+            category = classify_story(
+                title
+            )
+
 
             # MVP: only include regular news.
             if category != "news":
+
                 continue
+
 
             all_stories.append({
                 "source": name,
@@ -240,6 +860,7 @@ for name, url in FEEDS.items():
                 "published": published
             })
 
+
     except Exception as error:
 
         print(
@@ -247,7 +868,9 @@ for name, url in FEEDS.items():
             f"Skipping it."
         )
 
-        print(f"Error: {error}")
+        print(
+            f"Error: {error}"
+        )
 
 
 # ---------------------------------------------------------
@@ -255,6 +878,7 @@ for name, url in FEEDS.items():
 # ---------------------------------------------------------
 
 stories_by_source = defaultdict(list)
+
 
 for story in all_stories:
 
@@ -275,15 +899,20 @@ for source in stories_by_source:
 # BUILD EMAIL
 # ---------------------------------------------------------
 
-today = datetime.now().strftime(
+today = datetime.now(
+    ZoneInfo("America/Toronto")
+).strftime(
     "%B %-d, %Y"
 )
 
+
 message = EmailMessage()
+
 
 message["Subject"] = (
     f"Morning News Digest — {today}"
 )
+
 
 message["From"] = email_address
 message["To"] = email_address
@@ -295,16 +924,22 @@ message["To"] = email_address
 
 text_lines = []
 
+
 text_lines.append(
     "MORNING NEWS DIGEST"
 )
 
-text_lines.append(today)
+text_lines.append(
+    today
+)
 
 text_lines.append("")
 
 
-# Weather block.
+# ---------------------------------------------------------
+# WEATHER
+# ---------------------------------------------------------
+
 if weather:
 
     text_lines.append(
@@ -324,6 +959,74 @@ if weather:
     text_lines.append("")
 
 
+# ---------------------------------------------------------
+# COMMITTEE WATCH
+# ---------------------------------------------------------
+
+if committee_meetings:
+
+    text_lines.append(
+        "COMMITTEE WATCH"
+    )
+
+    text_lines.append("")
+
+
+    for meeting in committee_meetings:
+
+        notice = meeting["notice"]
+
+
+        text_lines.append(
+            f"🏛️ {meeting['committee']}"
+        )
+
+        text_lines.append(
+            f"{meeting['time']} — "
+            f"{notice['subject'] or 'Subject not listed'}"
+        )
+
+
+        if meeting["location"]:
+
+            text_lines.append(
+                f"📍 {meeting['location']}"
+            )
+
+
+        if (
+            meeting["broadcast"]
+            or notice["televised"]
+        ):
+
+            text_lines.append(
+                "📺 Televised"
+            )
+
+
+        if notice["witnesses"]:
+
+            text_lines.append(
+                "Witnesses:"
+            )
+
+            for witness in notice["witnesses"]:
+
+                text_lines.append(
+                    f"  • {witness}"
+                )
+
+
+        if meeting["notice_url"]:
+
+            text_lines.append(
+                f"Notice: {meeting['notice_url']}"
+            )
+
+
+        text_lines.append("")
+
+
 text_lines.append(
     f"{len(all_stories)} news stories "
     f"from the last 30 hours."
@@ -332,9 +1035,12 @@ text_lines.append(
 text_lines.append("")
 
 
-for source in sorted(stories_by_source):
+for source in sorted(
+    stories_by_source
+):
 
     text_lines.append("")
+
     text_lines.append(
         source.upper()
     )
@@ -342,6 +1048,7 @@ for source in sorted(stories_by_source):
     text_lines.append(
         "=" * len(source)
     )
+
 
     for story in stories_by_source[source]:
 
@@ -366,6 +1073,7 @@ plain_text = "\n".join(
 # ---------------------------------------------------------
 
 html_parts = []
+
 
 html_parts.append("""
 <!DOCTYPE html>
@@ -399,14 +1107,16 @@ h1 {
     margin-bottom: 25px;
 }
 
-.weather {
+.weather,
+.committees {
     background-color: #f5f7f9;
     padding: 15px 18px;
     border-radius: 6px;
     margin-bottom: 25px;
 }
 
-.weather-title {
+.weather-title,
+.committee-title {
     font-size: 14px;
     font-weight: bold;
     letter-spacing: 0.5px;
@@ -416,6 +1126,48 @@ h1 {
 .weather-line {
     font-size: 16px;
     margin: 5px 0;
+}
+
+.committee {
+    padding: 12px 0;
+    border-top: 1px solid #dddddd;
+}
+
+.committee:first-of-type {
+    border-top: none;
+    padding-top: 0;
+}
+
+.committee-name {
+    font-weight: bold;
+    font-size: 16px;
+    margin-bottom: 5px;
+}
+
+.committee-subject {
+    font-size: 15px;
+    line-height: 1.4;
+    margin-bottom: 6px;
+}
+
+.committee-detail {
+    font-size: 14px;
+    color: #555555;
+    margin: 3px 0;
+}
+
+.committee-link {
+    font-size: 14px;
+    margin-top: 6px;
+}
+
+.committee-link a {
+    color: #174a8b;
+    text-decoration: none;
+}
+
+.committee-link a:hover {
+    text-decoration: underline;
 }
 
 .source {
@@ -454,6 +1206,7 @@ h1 {
 <div class="date">
 """)
 
+
 html_parts.append(
     html.escape(today)
 )
@@ -463,7 +1216,10 @@ html_parts.append(
 )
 
 
-# Weather HTML.
+# ---------------------------------------------------------
+# WEATHER HTML
+# ---------------------------------------------------------
+
 if weather:
 
     html_parts.append(
@@ -494,20 +1250,158 @@ if weather:
     )
 
 
+# ---------------------------------------------------------
+# COMMITTEE HTML
+# ---------------------------------------------------------
+
+if committee_meetings:
+
+    html_parts.append(
+        """
+        <div class="committees">
+
+            <div class="committee-title">
+                🏛️ COMMITTEE WATCH
+            </div>
+        """
+    )
+
+
+    for meeting in committee_meetings:
+
+        notice = meeting["notice"]
+
+
+        html_parts.append(
+            '<div class="committee">'
+        )
+
+
+        html_parts.append(
+            f"""
+            <div class="committee-name">
+                {html.escape(meeting['committee'])}
+            </div>
+            """
+        )
+
+
+        subject = (
+            notice["subject"]
+            or "Subject not listed"
+        )
+
+
+        html_parts.append(
+            f"""
+            <div class="committee-subject">
+                <strong>
+                {html.escape(meeting['time'])}
+                </strong>
+                — {html.escape(subject)}
+            </div>
+            """
+        )
+
+
+        if meeting["location"]:
+
+            html_parts.append(
+                f"""
+                <div class="committee-detail">
+                    📍 {html.escape(meeting['location'])}
+                </div>
+                """
+            )
+
+
+        if (
+            meeting["broadcast"]
+            or notice["televised"]
+        ):
+
+            html_parts.append(
+                """
+                <div class="committee-detail">
+                    📺 Televised
+                </div>
+                """
+            )
+
+
+        if notice["witnesses"]:
+
+            html_parts.append(
+                """
+                <div class="committee-detail">
+                    <strong>Witnesses:</strong>
+                </div>
+                """
+            )
+
+            for witness in notice["witnesses"]:
+
+                html_parts.append(
+                    f"""
+                    <div class="committee-detail">
+                        • {html.escape(witness)}
+                    </div>
+                    """
+                )
+
+
+        if meeting["notice_url"]:
+
+            safe_notice_url = html.escape(
+                meeting["notice_url"],
+                quote=True
+            )
+
+            html_parts.append(
+                f"""
+                <div class="committee-link">
+                    <a href="{safe_notice_url}">
+                        Notice of Meeting →
+                    </a>
+                </div>
+                """
+            )
+
+
+        html_parts.append(
+            "</div>"
+        )
+
+
+    html_parts.append(
+        "</div>"
+    )
+
+
+# ---------------------------------------------------------
+# NEWS COUNT
+# ---------------------------------------------------------
+
 html_parts.append(
     f"<p>{len(all_stories)} news stories "
     f"from the last 30 hours.</p>"
 )
 
 
-# News stories.
-for source in sorted(stories_by_source):
+# ---------------------------------------------------------
+# NEWS STORIES
+# ---------------------------------------------------------
+
+for source in sorted(
+    stories_by_source
+):
 
     html_parts.append(
         f'<div class="source">'
         f'{html.escape(source)}'
         f'</div>'
     )
+
 
     for story in stories_by_source[source]:
 
@@ -519,6 +1413,7 @@ for source in sorted(stories_by_source):
             story["link"],
             quote=True
         )
+
 
         html_parts.append(
             f"""
@@ -544,7 +1439,10 @@ html_body = "".join(
 )
 
 
-# Attach both versions.
+# ---------------------------------------------------------
+# SEND EMAIL
+# ---------------------------------------------------------
+
 message.set_content(
     plain_text
 )
@@ -554,10 +1452,6 @@ message.add_alternative(
     subtype="html"
 )
 
-
-# ---------------------------------------------------------
-# SEND EMAIL
-# ---------------------------------------------------------
 
 with smtplib.SMTP_SSL(
     "smtp.gmail.com",
@@ -576,5 +1470,6 @@ with smtplib.SMTP_SSL(
 
 print(
     f"Digest sent successfully! "
-    f"{len(all_stories)} news stories included."
+    f"{len(all_stories)} news stories included. "
+    f"{len(committee_meetings)} committee meetings included."
 )
