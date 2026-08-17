@@ -1,60 +1,62 @@
-from urllib.request import Request, urlopen
+import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
+from urllib.parse import urljoin
 import re
 
+BASE_URL = "https://www.ourcommons.ca"
 MEETINGS_URL = "https://www.ourcommons.ca/committees/en/Meetings"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-
-
-def get_page(url):
-    request = Request(url, headers=HEADERS)
-
-    with urlopen(request, timeout=30) as response:
-        html = response.read()
-
-    return BeautifulSoup(html, "html.parser")
 
 
 def clean_text(text):
-    return " ".join(text.split())
+    """Clean up whitespace in scraped text."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def absolute_url(href):
-    if not href:
-        return None
+def get_page(url):
+    """Retrieve a webpage."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        )
+    }
 
-    if href.startswith("//"):
-        return "https:" + href
-
-    if href.startswith("/"):
-        return "https://www.ourcommons.ca" + href
-
-    return href
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.text
 
 
-def find_upcoming_meetings():
-    soup = get_page(MEETINGS_URL)
+def get_upcoming_meetings():
+    """Find genuinely upcoming meetings from the House of Commons meetings page."""
 
-    meeting_blocks = soup.select(
-        "div[id^='collapse-meeting-']"
-    )
+    html = get_page(MEETINGS_URL)
+    soup = BeautifulSoup(html, "html.parser")
 
-    print(
-        f"Found {len(meeting_blocks)} meeting blocks on the page."
-    )
+    meeting_blocks = soup.select("div.panel-collapse[id^='collapse-meeting-']")
 
-    meetings = []
+    print(f"Found {len(meeting_blocks)} meeting blocks on the page.")
+    print()
+
+    today = datetime.now().date()
+    upcoming = []
 
     for block in meeting_blocks:
 
-        # Ignore meetings that have already happened
-        # or have been suspended.
-        if block.select_one(".is-suspended"):
-            continue
+        # ------------------------------------------------------------
+        # Ignore suspended meetings
+        # ------------------------------------------------------------
+        status = block.select_one(".meeting-card-meeting-status")
 
+        if status:
+            status_text = clean_text(status.get_text(" ", strip=True)).lower()
+
+            if "suspended" in status_text:
+                continue
+
+        # ------------------------------------------------------------
+        # Committee name
+        # ------------------------------------------------------------
         committee_link = block.select_one(
             ".meeting-card-committee-details-name a"
         )
@@ -62,10 +64,11 @@ def find_upcoming_meetings():
         if not committee_link:
             continue
 
-        committee = clean_text(
-            committee_link.get_text()
-        )
+        committee_name = clean_text(committee_link.get_text(" ", strip=True))
 
+        # ------------------------------------------------------------
+        # Meeting date/time
+        # ------------------------------------------------------------
         datetime_element = block.select_one(
             ".meeting-card-attribute[id^='meeting-datetime-']"
         )
@@ -73,21 +76,81 @@ def find_upcoming_meetings():
         if not datetime_element:
             continue
 
-        time_text = clean_text(
-            datetime_element.get_text()
+        datetime_text = clean_text(
+            datetime_element.get_text(" ", strip=True)
         )
 
-        location_element = block.select_one(
-            ".meeting-location"
+        # The page displays the actual date for past meetings,
+        # but upcoming meetings may display only the time because
+        # the page groups them under "Tomorrow", "Today", etc.
+        #
+        # We therefore use the page's surrounding accordion heading
+        # when necessary and explicitly recognize "Tomorrow".
+        meeting_date = None
+
+        # Look for an explicit date anywhere in the meeting block.
+        date_match = re.search(
+            r"(January|February|March|April|May|June|July|August|"
+            r"September|October|November|December)\s+\d{1,2},\s+\d{4}",
+            datetime_text,
+            re.IGNORECASE,
         )
+
+        if date_match:
+            try:
+                meeting_date = datetime.strptime(
+                    date_match.group(0),
+                    "%B %d, %Y"
+                ).date()
+            except ValueError:
+                pass
+
+        # If there is no explicit date, look at the page heading/group.
+        if meeting_date is None:
+            for parent in block.parents:
+                if parent is None:
+                    break
+
+                text = clean_text(parent.get_text(" ", strip=True))
+
+                if "Tomorrow" in text:
+                    from datetime import timedelta
+                    meeting_date = today + timedelta(days=1)
+                    break
+
+        # ------------------------------------------------------------
+        # If we still can't determine the date, skip it.
+        # ------------------------------------------------------------
+        if meeting_date is None:
+            continue
+
+        # Only keep future meetings.
+        if meeting_date < today:
+            continue
+
+        # ------------------------------------------------------------
+        # Time
+        # ------------------------------------------------------------
+        time_text = datetime_text
+
+        # Remove date if present so the output is cleaner.
+        if date_match:
+            time_text = time_text.replace(date_match.group(0), "").strip()
+
+        # ------------------------------------------------------------
+        # Location
+        # ------------------------------------------------------------
+        location_element = block.select_one(".meeting-location")
 
         location = ""
-
         if location_element:
             location = clean_text(
-                location_element.get_text()
+                location_element.get_text(" ", strip=True)
             )
 
+        # ------------------------------------------------------------
+        # Broadcast
+        # ------------------------------------------------------------
         broadcast = ""
 
         broadcast_element = block.select_one(
@@ -96,315 +159,326 @@ def find_upcoming_meetings():
 
         if broadcast_element:
             broadcast = clean_text(
-                broadcast_element.get_text()
+                broadcast_element.get_text(" ", strip=True)
             )
 
+        # ------------------------------------------------------------
+        # Studies / activities
+        # ------------------------------------------------------------
         studies = []
 
         for study in block.select(
             ".meeting-card-studies-list .meeting-card-study"
         ):
-            text = clean_text(
-                study.get_text()
-            )
+            text = clean_text(study.get_text(" ", strip=True))
 
             if text:
                 studies.append(text)
 
+        # ------------------------------------------------------------
+        # Notice of Meeting link
+        # ------------------------------------------------------------
         notice_link = block.select_one(
             "a.btn-meeting-notice"
         )
 
-        notice_url = None
+        notice_url = ""
 
-        if notice_link:
-            notice_url = absolute_url(
-                notice_link.get("href")
+        if notice_link and notice_link.get("href"):
+            notice_url = urljoin(
+                BASE_URL,
+                notice_link["href"]
             )
 
-        meetings.append({
-            "committee": committee,
+        # ------------------------------------------------------------
+        # Meeting page
+        # ------------------------------------------------------------
+        meeting_id = block.get("id", "").replace(
+            "collapse-meeting-", ""
+        )
+
+        meeting_page = (
+            f"{MEETINGS_URL}#collapse-meeting-{meeting_id}"
+        )
+
+        upcoming.append({
+            "committee": committee_name,
+            "date": meeting_date,
             "time": time_text,
             "location": location,
             "broadcast": broadcast,
             "studies": studies,
-            "notice_url": notice_url
+            "meeting_page": meeting_page,
+            "notice_url": notice_url,
         })
 
-    return meetings
-
-
-def get_notice_text(notice_url):
-    soup = get_page(notice_url)
-
-    # Remove things that aren't part of the actual notice.
-    for tag in soup([
-        "script",
-        "style",
-        "noscript",
-        "nav",
-        "header",
-        "footer"
-    ]):
-        tag.decompose()
-
-    # Remove Parliament/session navigation.
-    for element in soup.select(
-        ".session-selector, "
-        ".session-selector-session, "
-        ".session-popover-details, "
-        ".session-button-wrapper"
-    ):
-        element.decompose()
-
-    # Try to find the actual document.
-    possible_containers = [
-        "main",
-        "#main-content",
-        ".document-content",
-        ".document-viewer",
-        ".notice-of-meeting",
-        ".meeting-notice"
-    ]
-
-    container = None
-
-    for selector in possible_containers:
-
-        candidate = soup.select_one(selector)
-
-        if candidate and len(
-            candidate.get_text(" ", strip=True)
-        ) > 100:
-
-            container = candidate
-            break
-
-    if container is None:
-        container = soup.body
-
-    text = container.get_text(
-        "\n",
-        strip=True
-    )
-
-    lines = []
-
-    for line in text.splitlines():
-
-        line = clean_text(line)
-
-        if line:
-            lines.append(line)
-
-    return lines
-
-
-def find_line(lines, phrase):
-    """
-    Return the first line containing a phrase.
-    """
-
-    phrase = phrase.lower()
-
-    for line in lines:
-
-        if phrase in line.lower():
-            return line
-
-    return None
-
-
-def extract_meeting_details(lines):
-    details = {
-        "date": None,
-        "time": None,
-        "location": None,
-        "televised": False,
-        "subject": None,
-        "witnesses": []
-    }
-
-    # ---------------------------------------------------------
-    # DATE
-    # ---------------------------------------------------------
-
-    date_pattern = re.compile(
-        r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
-        r"[A-Z][a-z]+ \d{1,2}, \d{4}"
-    )
-
-    for line in lines:
-
-        match = date_pattern.search(line)
-
-        if match:
-            details["date"] = match.group(0)
-            break
-
-    # ---------------------------------------------------------
-    # TIME
-    # ---------------------------------------------------------
-
-    time_pattern = re.compile(
-        r"\d{1,2}:\d{2} [ap]\.m\. to \d{1,2}:\d{2} [ap]\.m\."
-    )
-
-    for line in lines:
-
-        match = time_pattern.search(line)
-
-        if match:
-            details["time"] = match.group(0)
-            break
-
-    # ---------------------------------------------------------
-    # LOCATION
-    # ---------------------------------------------------------
-
-    location_pattern = re.compile(
-        r"(Room .*?)(?:, Televised|, Committee clerk|$)"
-    )
-
-    for line in lines:
-
-        if line.startswith("Room "):
-
-            details["location"] = line.strip()
-
-            break
-
-    # ---------------------------------------------------------
-    # TELEVISED
-    # ---------------------------------------------------------
-
-    for line in lines:
-
-        if line.lower() == "televised":
-
-            details["televised"] = True
-
-            break
-
-    # ---------------------------------------------------------
-    # SUBJECT
-    # ---------------------------------------------------------
-
-    # The notice generally contains a line beginning with
-    # "Meeting" that contains the real purpose of the meeting.
-    #
-    # Example:
-    #
-    # Meeting Requested Pursuant to Standing Order 106(4)
-    # to Discuss a Request to Undertake a Study of Allegations
-    # Concerning the NATO Military Headquarters
-
-    subject_candidates = []
-
-    for line in lines:
-
-        lower = line.lower()
-
-        if (
-            lower.startswith("meeting requested")
-            or
-            lower.startswith("meeting to")
-            or
-            lower.startswith("meeting for")
-        ):
-
-            subject_candidates.append(line)
-
-    if subject_candidates:
-
-        # Usually the longest candidate is the useful one.
-        details["subject"] = max(
-            subject_candidates,
-            key=len
+    # Sort chronologically.
+    upcoming.sort(
+        key=lambda x: (
+            x["date"],
+            x["time"]
         )
+    )
 
-    # ---------------------------------------------------------
-    # WITNESSES
-    # ---------------------------------------------------------
+    return upcoming
 
-    witness_start = None
 
-    for i, line in enumerate(lines):
+def parse_notice(notice_url):
+    """Read a Notice of Meeting and extract subject/witness information."""
 
-        lower = line.lower()
-
-        if (
-            lower == "witnesses"
-            or
-            lower == "witness"
-            or
-            lower.startswith("witnesses:")
-            or
-            lower.startswith("witness:")
-        ):
-
-            witness_start = i
-
-            break
-
-    if witness_start is not None:
-
-        # Examine the material after the Witnesses heading.
-        #
-        # We stop when we encounter a new major section.
-
-        stop_words = {
-            "committee clerk",
-            "committee members",
-            "staff",
-            "other business",
-            "notice of meeting",
-            "evidence",
-            "minutes of proceedings"
+    if not notice_url:
+        return {
+            "date": "",
+            "time": "",
+            "location": "",
+            "televised": False,
+            "subject": "",
+            "witnesses": [],
         }
 
-        for line in lines[witness_start + 1:]:
+    try:
+        html = get_page(notice_url)
+    except Exception as e:
+        print(f"Could not retrieve notice: {e}")
 
+        return {
+            "date": "",
+            "time": "",
+            "location": "",
+            "televised": False,
+            "subject": "",
+            "witnesses": [],
+        }
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # ------------------------------------------------------------
+    # Get all visible text
+    # ------------------------------------------------------------
+    text = soup.get_text("\n", strip=True)
+
+    lines = [
+        clean_text(line)
+        for line in text.splitlines()
+        if clean_text(line)
+    ]
+
+    # ------------------------------------------------------------
+    # Date
+    # ------------------------------------------------------------
+    date_value = ""
+
+    date_pattern = re.compile(
+        r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+        r"(January|February|March|April|May|June|July|August|September|"
+        r"October|November|December) \d{1,2}, \d{4}$"
+    )
+
+    for line in lines:
+        if date_pattern.match(line):
+            date_value = line
+            break
+
+    # ------------------------------------------------------------
+    # Time
+    # ------------------------------------------------------------
+    time_value = ""
+
+    time_pattern = re.compile(
+        r"^\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.)\s*to\s*"
+        r"\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.)$",
+        re.IGNORECASE
+    )
+
+    for line in lines:
+        if time_pattern.match(line):
+            time_value = line
+            break
+
+    # ------------------------------------------------------------
+    # Location
+    # ------------------------------------------------------------
+    location_value = ""
+
+    for line in lines:
+        if (
+            "Building" in line
+            and ("Room" in line or "room" in line)
+        ):
+            location_value = line
+            break
+
+    # ------------------------------------------------------------
+    # Televised
+    # ------------------------------------------------------------
+    televised = any(
+        line.lower() == "televised"
+        for line in lines
+    )
+
+    # ------------------------------------------------------------
+    # Subject
+    #
+    # On the notice, this appears after the date/time/location
+    # information and before "Committee clerk".
+    # ------------------------------------------------------------
+    subject = ""
+
+    clerk_index = None
+
+    for i, line in enumerate(lines):
+        if line.lower() == "committee clerk":
+            clerk_index = i
+            break
+
+    if clerk_index is not None:
+        # Look backwards for the substantive paragraph.
+        candidates = []
+
+        for line in lines[:clerk_index]:
+            if len(line) > 50:
+                candidates.append(line)
+
+        if candidates:
+            # Usually the final long line before the clerk information
+            # is the subject.
+            subject = candidates[-1]
+
+    # ------------------------------------------------------------
+    # Witnesses
+    #
+    # We deliberately look for actual witness names/titles rather than
+    # treating the committee name itself as a witness.
+    # ------------------------------------------------------------
+    witnesses = []
+
+    # First look for headings such as "Witnesses", "Appearing", etc.
+    witness_index = None
+
+    for i, line in enumerate(lines):
+        lower = line.lower()
+
+        if lower in (
+            "witnesses",
+            "witness",
+            "appearing",
+            "appearing before the committee",
+        ):
+            witness_index = i
+            break
+
+    if witness_index is not None:
+        for line in lines[witness_index + 1:]:
             lower = line.lower()
 
-            if lower in stop_words:
+            if lower in (
+                "committee clerk",
+                "meeting agenda",
+                "agenda",
+                "notice of meeting",
+            ):
                 break
 
-            # Ignore obvious navigation / boilerplate.
-            if lower in {
-                "witnesses",
-                "witness",
-                "appearing"
-            }:
-                continue
-
-            # Ignore very short junk lines.
+            # Skip generic navigation/header text.
             if len(line) < 3:
                 continue
 
-            details["witnesses"].append(line)
+            if line.lower().startswith(
+                (
+                    "standing committee",
+                    "committee meeting",
+                    "notices of meeting",
+                )
+            ):
+                continue
 
-    # ---------------------------------------------------------
-    # NO FALLBACK WITNESS DETECTION
-    # ---------------------------------------------------------
-    #
-    # Only treat text as witnesses if it appears under an
-    # explicit Witnesses heading. This prevents committee
-    # names, titles and other notice text from being mistaken
-    # for witnesses.
+            witnesses.append(line)
 
     # Remove duplicates while preserving order.
-
     cleaned_witnesses = []
 
-    for witness in details["witnesses"]:
-
+    for witness in witnesses:
         if witness not in cleaned_witnesses:
             cleaned_witnesses.append(witness)
 
-    details["witnesses"] = cleaned_witnesses
+    return {
+        "date": date_value,
+        "time": time_value,
+        "location": location_value,
+        "televised": televised,
+        "subject": subject,
+        "witnesses": cleaned_witnesses,
+    }
 
-    return details
+
+def print_meeting(meeting):
+    """Print a meeting in a readable format."""
+
+    print("MEETING")
+    print("-" * 60)
+
+    print(f"Committee: {meeting['committee']}")
+    print(f"Date: {meeting['date'].strftime('%A, %B %d, %Y')}")
+    print(f"Time: {meeting['time']}")
+
+    if meeting["location"]:
+        print(f"Location: {meeting['location']}")
+
+    if meeting["broadcast"]:
+        print(f"Broadcast: {meeting['broadcast']}")
+
+    print()
+    print("Studies / Activities:")
+
+    if meeting["studies"]:
+        for study in meeting["studies"]:
+            print(f"  - {study}")
+    else:
+        print("  - None listed")
+
+    print()
+    print(f"Meeting page: {meeting['meeting_page']}")
+
+    if meeting["notice_url"]:
+        print(f"Notice: {meeting['notice_url']}")
+
+        print()
+        print("Reading Notice of Meeting...")
+
+        notice = parse_notice(meeting["notice_url"])
+
+        print()
+        print("-" * 60)
+        print("NOTICE DETAILS")
+        print("-" * 60)
+
+        if notice["date"]:
+            print(f"Date: {notice['date']}")
+
+        if notice["time"]:
+            print(f"Time: {notice['time']}")
+
+        if notice["location"]:
+            print(f"Location: {notice['location']}")
+
+        print(f"Televised: {'Yes' if notice['televised'] else 'No'}")
+
+        print()
+        print("SUBJECT:")
+
+        if notice["subject"]:
+            print(f"  {notice['subject']}")
+        else:
+            print("  Could not identify subject")
+
+        print()
+        print("WITNESSES:")
+
+        if notice["witnesses"]:
+            for witness in notice["witnesses"]:
+                print(f"  - {witness}")
+        else:
+            print("  No witnesses listed")
 
 
 def main():
@@ -412,130 +486,34 @@ def main():
     print("=" * 60)
     print("HOUSE OF COMMONS COMMITTEE TEST")
     print("=" * 60)
+    print()
 
-    meetings = find_upcoming_meetings()
-
-    print(
-        f"\nUpcoming meetings found: {len(meetings)}"
-    )
-
-    if not meetings:
-
-        print(
-            "\nNo upcoming committee meetings found."
-        )
-
+    try:
+        meetings = get_upcoming_meetings()
+    except Exception as e:
+        print(f"ERROR retrieving committee meetings: {e}")
         return
 
-    for meeting in meetings:
+    print()
+    print("Upcoming meetings found:", len(meetings))
+    print()
 
-        print("\n" + "=" * 60)
-        print("MEETING")
-        print("=" * 60)
+    if not meetings:
+        print("No upcoming committee meetings found.")
+        return
 
-        print(
-            f"Committee: {meeting['committee']}"
-        )
-
-        print(
-            f"Meeting-page time: {meeting['time']}"
-        )
-
-        if meeting["location"]:
-
-            print(
-                f"Meeting-page location: "
-                f"{meeting['location']}"
-            )
-
-        if meeting["broadcast"]:
-
-            print(
-                f"Meeting-page broadcast: "
-                f"{meeting['broadcast']}"
-            )
-
-        print("\nStudies / Activities:")
-
-        if meeting["studies"]:
-
-            for study in meeting["studies"]:
-                print(f"  - {study}")
-
-        else:
-
-            print("  None listed")
-
-        print(
-            f"\nNotice: {meeting['notice_url']}"
-        )
-
-        if not meeting["notice_url"]:
-            continue
-
-        print(
-            "\nReading Notice of Meeting..."
-        )
-
-        lines = get_notice_text(
-            meeting["notice_url"]
-        )
-
-        details = extract_meeting_details(
-            lines
-        )
-
-        print("\n" + "-" * 60)
-        print("NOTICE DETAILS")
-        print("-" * 60)
-
-        print(
-            f"Date: {details['date'] or 'Not identified'}"
-        )
-
-        print(
-            f"Time: {details['time'] or 'Not identified'}"
-        )
-
-        print(
-            f"Location: "
-            f"{details['location'] or 'Not identified'}"
-        )
-
-        print(
-            f"Televised: "
-            f"{'Yes' if details['televised'] else 'No / not specified'}"
-        )
-
-        print("\nSUBJECT:")
-
-        if details["subject"]:
-            print(
-                f"  {details['subject']}"
-            )
-        else:
-            print(
-                "  Could not identify subject"
-            )
-
-        print("\nWITNESSES:")
-
-        if details["witnesses"]:
-
-            for witness in details["witnesses"]:
-                print(
-                    f"  - {witness}"
-                )
-
-        else:
-
-            print(
-                "  No witnesses listed"
-            )
-
-    print("\n" + "=" * 60)
-    print("TEST COMPLETE")
     print("=" * 60)
+    print("UPCOMING MEETINGS")
+    print("=" * 60)
+    print()
+
+    for meeting in meetings:
+        print_meeting(meeting)
+        print()
+        print("=" * 60)
+        print()
+
+    print("TEST COMPLETE")
 
 
 if __name__ == "__main__":
