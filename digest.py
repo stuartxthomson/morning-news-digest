@@ -527,18 +527,16 @@ def get_upcoming_committee_meetings():
 
                 pass
 
-
         # -----------------------------------------------------
-        # Upcoming meetings sometimes say "Tomorrow"
+        # Upcoming meetings sometimes say "Today" or "Tomorrow"
         # rather than giving the date.
         # -----------------------------------------------------
 
         if meeting_date is None:
-
+    
             for parent in block.parents:
-
+        
                 if parent is None:
-
                     break
 
                 text = clean_text(
@@ -548,13 +546,15 @@ def get_upcoming_committee_meetings():
                     )
                 )
 
-                if "Tomorrow" in text:
+        if "Today" in text:
+            meeting_date = today
+            break
 
-                    meeting_date = (
-                        today + timedelta(days=1)
-                    )
-
-                    break
+        if "Tomorrow" in text:
+            meeting_date = (
+                today + timedelta(days=1)
+            )
+            break
 
 
         if meeting_date is None:
