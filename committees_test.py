@@ -1,6 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 import re
 
@@ -38,7 +39,7 @@ def get_upcoming_meetings():
     print(f"Found {len(meeting_blocks)} meeting blocks on the page.")
     print()
 
-    today = datetime.now().date()
+    today = datetime.now(ZoneInfo("America/Toronto")).date()
     upcoming = []
 
     for block in meeting_blocks:
@@ -114,7 +115,6 @@ def get_upcoming_meetings():
                 text = clean_text(parent.get_text(" ", strip=True))
 
                 if "Tomorrow" in text:
-                    from datetime import timedelta
                     meeting_date = today + timedelta(days=1)
                     break
 
