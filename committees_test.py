@@ -385,43 +385,13 @@ def extract_meeting_details(lines):
             details["witnesses"].append(line)
 
     # ---------------------------------------------------------
-    # FALLBACK WITNESS DETECTION
+    # NO FALLBACK WITNESS DETECTION
     # ---------------------------------------------------------
-
-    # Some notices don't have a clean "Witnesses" heading.
-    # Look for common Canadian parliamentary witness
-    # organization/title patterns.
-
-    if not details["witnesses"]:
-
-        witness_keywords = [
-            "minister",
-            "deputy minister",
-            "assistant deputy minister",
-            "chief",
-            "president",
-            "commissioner",
-            "director",
-            "secretary",
-            "clerk",
-            "chief of the defence staff",
-            "national security",
-            "privy council"
-        ]
-
-        for line in lines:
-
-            lower = line.lower()
-
-            if any(
-                keyword in lower
-                for keyword in witness_keywords
-            ):
-
-                # Avoid pulling in navigation text.
-                if len(line) > 15 and len(line) < 250:
-
-                    details["witnesses"].append(line)
+    #
+    # Only treat text as witnesses if it appears under an
+    # explicit Witnesses heading. This prevents committee
+    # names, titles and other notice text from being mistaken
+    # for witnesses.
 
     # Remove duplicates while preserving order.
 
