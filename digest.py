@@ -4,16 +4,15 @@ import os
 import smtplib
 import html
 import urllib.request
+import urllib.parse
 import json
-import requests
 import re
+import requests
 
 from bs4 import BeautifulSoup
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from email.message import EmailMessage
-from urllib.parse import urljoin
 
 from sources import FEEDS
 
@@ -22,16 +21,20 @@ from sources import FEEDS
 socket.setdefaulttimeout(10)
 
 
-# Get Gmail credentials from GitHub Secrets.
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+
 email_address = os.environ["EMAIL_ADDRESS"]
 app_password = os.environ["EMAIL_APP_PASSWORD"]
 
+cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 
-# Look back 30 hours.
-cutoff_time = (
-    datetime.now(timezone.utc)
-    - timedelta(hours=30)
-)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; Morning News Digest/1.0)"
+    )
+}
 
 
 # ---------------------------------------------------------
@@ -41,6 +44,8 @@ cutoff_time = (
 def get_ottawa_weather():
     """
     Get Ottawa's 7 a.m. forecast from Open-Meteo.
+
+    No API key or account is required.
     """
 
     weather_url = (
@@ -155,620 +160,743 @@ weather = get_ottawa_weather()
 
 
 # ---------------------------------------------------------
-# HOUSE OF COMMONS COMMITTEE MEETINGS
+# COMMITTEE SCRAPER
 # ---------------------------------------------------------
 
-BASE_URL = "https://www.ourcommons.ca"
-
-MEETINGS_URL = (
+COMMITTEE_MEETINGS_URL = (
     "https://www.ourcommons.ca/committees/en/Meetings"
 )
 
 
-def clean_text(text):
-    """Clean up whitespace in scraped text."""
+def parse_committee_date(text):
 
-    return re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
+    """
+    Extract a date from a meeting card.
 
+    This deliberately looks for the actual date rather than
+    relying on labels such as 'Tomorrow', 'Later Today',
+    or 'Earlier Today'.
+    """
 
-def get_committees_page(url):
+    if not text:
+        return None
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+    patterns = [
+
+        r"""
+        (?P<month>
+            January|February|March|April|May|June|
+            July|August|September|October|November|December
         )
-    }
+        \s+
+        (?P<day>\d{1,2})
+        (?:st|nd|rd|th)?
+        ,?
+        \s+
+        (?P<year>\d{4})
+        """,
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    return response.text
-
-
-def parse_committee_notice(notice_url):
-
-    try:
-
-        html_text = get_committees_page(
-            notice_url
-        )
-
-    except Exception as error:
-
-        print(
-            f"Could not retrieve committee notice: "
-            f"{error}"
-        )
-
-        return {
-            "date": "",
-            "time": "",
-            "location": "",
-            "televised": False,
-            "subject": "",
-            "witnesses": []
-        }
-
-    soup = BeautifulSoup(
-        html_text,
-        "html.parser"
-    )
-
-    text = soup.get_text(
-        "\n",
-        strip=True
-    )
-
-    lines = [
-        clean_text(line)
-        for line in text.splitlines()
-        if clean_text(line)
+        r"""
+        (?P<year>\d{4})
+        -
+        (?P<month>\d{1,2})
+        -
+        (?P<day>\d{1,2})
+        """
     ]
 
+    for pattern in patterns:
 
-    # -----------------------------------------------------
-    # DATE
-    # -----------------------------------------------------
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE | re.VERBOSE
+        )
 
-    date_value = ""
+        if not match:
+            continue
 
-    date_pattern = re.compile(
-        r"^(Monday|Tuesday|Wednesday|Thursday|Friday|"
-        r"Saturday|Sunday), "
-        r"(January|February|March|April|May|June|July|"
-        r"August|September|October|November|December) "
-        r"\d{1,2}, \d{4}$"
-    )
+        try:
 
-    for line in lines:
+            if match.group("month").isdigit():
 
-        if date_pattern.match(line):
+                return datetime(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day"))
+                ).date()
 
-            date_value = line
-            break
+            else:
 
-
-    # -----------------------------------------------------
-    # TIME
-    # -----------------------------------------------------
-
-    time_value = ""
-
-    time_pattern = re.compile(
-        r"^\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.)\s*to\s*"
-        r"\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.)$",
-        re.IGNORECASE
-    )
-
-    for line in lines:
-
-        if time_pattern.match(line):
-
-            time_value = line
-            break
-
-
-    # -----------------------------------------------------
-    # LOCATION
-    # -----------------------------------------------------
-
-    location_value = ""
-
-    for line in lines:
-
-        if (
-            "Building" in line
-            and (
-                "Room" in line
-                or "room" in line
-            )
-        ):
-
-            location_value = line
-            break
-
-
-    # -----------------------------------------------------
-    # TELEVISED
-    # -----------------------------------------------------
-
-    televised = any(
-        line.lower() == "televised"
-        for line in lines
-    )
-
-
-    # -----------------------------------------------------
-    # SUBJECT
-    # -----------------------------------------------------
-
-    subject = ""
-
-    clerk_index = None
-
-    for i, line in enumerate(lines):
-
-        if line.lower() == "committee clerk":
-
-            clerk_index = i
-            break
-
-
-    if clerk_index is not None:
-
-        candidates = []
-
-        for line in lines[:clerk_index]:
-
-            if len(line) > 50:
-
-                candidates.append(line)
-
-        if candidates:
-
-            subject = candidates[-1]
-
-
-    # -----------------------------------------------------
-    # WITNESSES
-    # -----------------------------------------------------
-
-    witnesses = []
-
-    witness_index = None
-
-    for i, line in enumerate(lines):
-
-        lower = line.lower()
-
-        if lower in (
-            "witnesses",
-            "witness",
-            "appearing",
-            "appearing before the committee"
-        ):
-
-            witness_index = i
-            break
-
-
-    if witness_index is not None:
-
-        for line in lines[witness_index + 1:]:
-
-            lower = line.lower()
-
-            if lower in (
-                "committee clerk",
-                "meeting agenda",
-                "agenda",
-                "notice of meeting"
-            ):
-
-                break
-
-            if len(line) < 3:
-                continue
-
-            if lower.startswith(
-                (
-                    "standing committee",
-                    "committee meeting",
-                    "notices of meeting"
+                month_name = (
+                    match.group("month").capitalize()
                 )
-            ):
 
-                continue
+                month_number = datetime.strptime(
+                    month_name,
+                    "%B"
+                ).month
 
-            witnesses.append(line)
+                return datetime(
+                    int(match.group("year")),
+                    month_number,
+                    int(match.group("day"))
+                ).date()
+
+        except ValueError:
+            return None
+
+    return None
 
 
-    cleaned_witnesses = []
+def extract_notice_details(notice_url):
 
-    for witness in witnesses:
+    """
+    Read the Notice of Meeting and extract the subject and
+    witnesses.
+    """
 
-        if witness not in cleaned_witnesses:
-
-            cleaned_witnesses.append(
-                witness
-            )
-
-
-    return {
-        "date": date_value,
-        "time": time_value,
-        "location": location_value,
-        "televised": televised,
-        "subject": subject,
-        "witnesses": cleaned_witnesses
+    details = {
+        "subject": "",
+        "witnesses": []
     }
-
-
-def get_upcoming_committee_meetings():
 
     try:
 
-        page_html = get_committees_page(
-            MEETINGS_URL
+        response = requests.get(
+            notice_url,
+            headers=HEADERS,
+            timeout=15
         )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        text = soup.get_text(
+            "\n",
+            strip=True
+        )
+
+        # -------------------------------------------------
+        # SUBJECT
+        # -------------------------------------------------
+
+        subject_markers = [
+            "Meeting Requested Pursuant to",
+            "Study of",
+            "Subject:"
+        ]
+
+        subject = ""
+
+        for marker in subject_markers:
+
+            index = text.find(marker)
+
+            if index >= 0:
+
+                possible = text[index:]
+
+                lines = [
+                    line.strip()
+                    for line in possible.splitlines()
+                    if line.strip()
+                ]
+
+                if lines:
+
+                    for line in lines[:5]:
+
+                        if (
+                            "Committee clerk" not in line
+                            and "2026-" not in line
+                            and len(line) > 20
+                        ):
+                            subject = line
+                            break
+
+                if subject:
+                    break
+
+        # A more precise fallback for the common House format.
+        if not subject:
+
+            for element in soup.find_all(
+                string=re.compile(
+                    r"Meeting Requested Pursuant",
+                    re.IGNORECASE
+                )
+            ):
+
+                parent_text = element.parent.get_text(
+                    " ",
+                    strip=True
+                )
+
+                if parent_text:
+                    subject = parent_text
+                    break
+
+        details["subject"] = subject
+
+
+        # -------------------------------------------------
+        # WITNESSES
+        # -------------------------------------------------
+
+        # Witnesses may appear under headings such as
+        # "Witnesses" or "Appearing".
+        witness_heading = None
+
+        for heading in soup.find_all(
+            ["h1", "h2", "h3", "h4", "strong", "b"]
+        ):
+
+            heading_text = heading.get_text(
+                " ",
+                strip=True
+            ).lower()
+
+            if heading_text in [
+                "witnesses",
+                "witnesses:",
+                "appearing",
+                "appearing:"
+            ]:
+
+                witness_heading = heading
+                break
+
+        if witness_heading:
+
+            # Collect nearby list items.
+            parent = witness_heading.parent
+
+            if parent:
+
+                for li in parent.find_all("li"):
+
+                    witness = li.get_text(
+                        " ",
+                        strip=True
+                    )
+
+                    if witness:
+                        details["witnesses"].append(
+                            witness
+                        )
+
+        # Second approach: inspect text after "Witnesses".
+        if not details["witnesses"]:
+
+            lines = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip()
+            ]
+
+            witness_index = None
+
+            for i, line in enumerate(lines):
+
+                if line.lower() in [
+                    "witnesses",
+                    "witnesses:"
+                ]:
+
+                    witness_index = i
+                    break
+
+            if witness_index is not None:
+
+                for line in lines[
+                    witness_index + 1:
+                    witness_index + 15
+                ]:
+
+                    if line.lower() in [
+                        "committee clerk",
+                        "evidence",
+                        "minutes of proceedings"
+                    ]:
+                        break
+
+                    if len(line) > 2:
+                        details["witnesses"].append(
+                            line
+                        )
+
+        # Remove obvious duplicates.
+        cleaned_witnesses = []
+
+        for witness in details["witnesses"]:
+
+            if witness not in cleaned_witnesses:
+                cleaned_witnesses.append(
+                    witness
+                )
+
+        details["witnesses"] = cleaned_witnesses
+
+        return details
 
     except Exception as error:
 
         print(
-            f"Could not retrieve committee meetings: "
-            f"{error}"
+            "Could not read Notice of Meeting:"
         )
 
-        return []
+        print(error)
+
+        return details
 
 
-    soup = BeautifulSoup(
-        page_html,
-        "html.parser"
+def committee_is_important(meeting):
+
+    """
+    Flag meetings likely to be particularly useful to
+    a political-news digest.
+    """
+
+    subject = (
+        meeting.get("subject", "")
+        .lower()
     )
 
-    meeting_blocks = soup.select(
-        "div.panel-collapse[id^='collapse-meeting-']"
+    witnesses = " ".join(
+        meeting.get("witnesses", [])
+    ).lower()
+
+    combined = (
+        subject + " " + witnesses
     )
 
-    print(
-        f"Found {len(meeting_blocks)} committee "
-        f"meeting blocks."
-    )
+    important_terms = [
+
+        # People / government
+        "minister",
+        "prime minister",
+        "privy council",
+        "clerk of the privy council",
+        "deputy minister",
+        "chief of staff",
+        "national security adviser",
+        "national security",
+
+        # Political subjects
+        "cbc",
+        "canadian broadcasting corporation",
+        "gun control",
+        "firearms",
+        "carbon tax",
+        "carbon pricing",
+
+        # Major controversies / institutions
+        "nato",
+        "military headquarters",
+        "foreign interference",
+        "election",
+        "elections",
+        "china",
+        "russia",
+        "iran",
+        "israel",
+        "hamas",
+        "trump",
+        "border",
+        "tariff",
+        "tariffs",
+        "trade",
+        "immigration",
+        "crime",
+        "policing",
+        "rcmp"
+    ]
+
+    for term in important_terms:
+
+        if term in combined:
+            return True
+
+    return False
 
 
-    # Use Ottawa time, not GitHub runner time.
-    today = datetime.now(
-        ZoneInfo("America/Toronto")
-    ).date()
+def get_committee_meetings():
 
-    upcoming = []
+    """
+    Retrieve all House of Commons committee meetings whose
+    actual meeting date is TODAY.
 
+    Important:
+    We do NOT use 'Tomorrow', 'Later Today', or
+    'Earlier Today' to determine whether a meeting belongs
+    in the digest.
 
-    for block in meeting_blocks:
+    We look for the actual date in each meeting block.
+    """
 
-        # -----------------------------------------------------
-        # Ignore suspended meetings.
-        # -----------------------------------------------------
+    meetings = []
 
-        status = block.select_one(
-            ".meeting-card-meeting-status"
+    today = datetime.now().date()
+
+    print("")
+    print("Checking House of Commons committees...")
+
+    try:
+
+        response = requests.get(
+            COMMITTEE_MEETINGS_URL,
+            headers=HEADERS,
+            timeout=20
         )
 
-        if status:
+        response.raise_for_status()
 
-            status_text = clean_text(
-                status.get_text(
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        blocks = soup.select(
+            "div[id^='collapse-meeting-']"
+        )
+
+        print(
+            f"Found {len(blocks)} meeting blocks."
+        )
+
+        for block in blocks:
+
+            # -------------------------------------------------
+            # STATUS
+            # -------------------------------------------------
+
+            status_element = block.select_one(
+                ".meeting-card-meeting-status"
+            )
+
+            status = ""
+
+            if status_element:
+                status = status_element.get_text(
                     " ",
                     strip=True
-                )
-            ).lower()
+                ).lower()
 
-            if "suspended" in status_text:
-
+            # Suspended meetings are historical meetings,
+            # even though they may still appear on the page.
+            if "suspended" in status:
                 continue
 
 
-        # -----------------------------------------------------
-        # Committee name.
-        # -----------------------------------------------------
+            # -------------------------------------------------
+            # COMMITTEE
+            # -------------------------------------------------
 
-        committee_link = block.select_one(
-            ".meeting-card-committee-details-name a"
-        )
+            committee_element = block.select_one(
+                ".meeting-card-committee-details-name"
+            )
 
-        if not committee_link:
+            if not committee_element:
+                continue
 
-            continue
-
-        committee_name = clean_text(
-            committee_link.get_text(
+            committee = committee_element.get_text(
                 " ",
                 strip=True
             )
-        )
 
 
-        # -----------------------------------------------------
-        # Date / time.
-        # -----------------------------------------------------
+            # -------------------------------------------------
+            # ACTUAL DATE
+            # -------------------------------------------------
 
-        datetime_element = block.select_one(
-            ".meeting-card-attribute[id^='meeting-datetime-']"
-        )
+            date_element = block.select_one(
+                ".meeting-card-attribute[id^='meeting-datetime-']"
+            )
 
-        if not datetime_element:
+            if not date_element:
+                continue
 
-            continue
-
-        datetime_text = clean_text(
-            datetime_element.get_text(
+            date_text = date_element.get_text(
                 " ",
                 strip=True
             )
-        )
 
+            meeting_date = parse_committee_date(
+                date_text
+            )
 
-        meeting_date = None
+            # Some current meetings omit the date from the
+            # visible time, so inspect the entire block as a
+            # fallback.
+            if meeting_date is None:
 
-
-        date_match = re.search(
-            r"(January|February|March|April|May|June|July|"
-            r"August|September|October|November|December) "
-            r"\d{1,2}, \d{4}",
-            datetime_text,
-            re.IGNORECASE
-        )
-
-
-        if date_match:
-
-            try:
-
-                meeting_date = datetime.strptime(
-                    date_match.group(0),
-                    "%B %d, %Y"
-                ).date()
-
-            except ValueError:
-
-                pass
-
-
-        # -----------------------------------------------------
-        # The House page sometimes uses relative labels:
-        #
-        #   Later Today
-        #   Today
-        #   Tomorrow
-        #
-        # "Earlier Today" should NOT count as upcoming.
-        # -----------------------------------------------------
-
-        if meeting_date is None:
-
-            block_text = clean_text(
-                block.get_text(
+                block_text = block.get_text(
                     " ",
                     strip=True
                 )
-            )
 
-            if "Later Today" in block_text:
-
-                meeting_date = today
-
-            elif "Tomorrow" in block_text:
-
-                meeting_date = (
-                    today + timedelta(days=1)
+                meeting_date = parse_committee_date(
+                    block_text
                 )
 
-            elif (
-                "Today" in block_text
-                and "Earlier Today" not in block_text
+            # If we cannot establish the actual date, do not
+            # guess.
+            if meeting_date is None:
+                continue
+
+            # THIS IS THE IMPORTANT FIX.
+            #
+            # We compare the actual date with today's date.
+            #
+            # Therefore a meeting remains eligible after its
+            # label changes from "Later Today" to
+            # "Earlier Today".
+            if meeting_date != today:
+                continue
+
+
+            # -------------------------------------------------
+            # TIME
+            # -------------------------------------------------
+
+            time_text = date_text
+
+            # Remove date if present.
+            time_text = re.sub(
+                r"""
+                (?P<month>
+                    January|February|March|April|May|June|
+                    July|August|September|October|November|December
+                )
+                \s+\d{1,2}(?:st|nd|rd|th)?,?
+                \s+\d{4}
+                """,
+                "",
+                time_text,
+                flags=re.IGNORECASE | re.VERBOSE
+            )
+
+            time_text = re.sub(
+                r"\s+",
+                " ",
+                time_text
+            ).strip()
+
+
+            # -------------------------------------------------
+            # LOCATION
+            # -------------------------------------------------
+
+            location_element = block.select_one(
+                ".meeting-location"
+            )
+
+            location = ""
+
+            if location_element:
+
+                location = location_element.get_text(
+                    " ",
+                    strip=True
+                )
+
+
+            # -------------------------------------------------
+            # BROADCAST
+            # -------------------------------------------------
+
+            broadcast = ""
+
+            broadcast_element = block.select_one(
+                ".meeting-card-media-preview .stream-type"
+            )
+
+            if broadcast_element:
+
+                broadcast = broadcast_element.get_text(
+                    " ",
+                    strip=True
+                )
+
+            else:
+
+                # Look for the television attribute.
+                attributes = block.select(
+                    ".meeting-card-attribute"
+                )
+
+                for attribute in attributes:
+
+                    attribute_text = attribute.get_text(
+                        " ",
+                        strip=True
+                    )
+
+                    if "Televised" in attribute_text:
+
+                        broadcast = "Televised"
+
+                        break
+
+
+            # -------------------------------------------------
+            # STUDIES / ACTIVITIES
+            # -------------------------------------------------
+
+            studies = []
+
+            for study in block.select(
+                ".meeting-card-study"
             ):
 
-                meeting_date = today
-
-
-        if meeting_date is None:
-
-            continue
-
-
-        if meeting_date < today:
-
-            continue
-
-
-        # -----------------------------------------------------
-        # Time.
-        # -----------------------------------------------------
-
-        time_text = datetime_text
-
-        if date_match:
-
-            time_text = (
-                time_text
-                .replace(
-                    date_match.group(0),
-                    ""
-                )
-                .strip()
-            )
-
-
-        # -----------------------------------------------------
-        # Location.
-        # -----------------------------------------------------
-
-        location_element = block.select_one(
-            ".meeting-location"
-        )
-
-        location = ""
-
-        if location_element:
-
-            location = clean_text(
-                location_element.get_text(
+                study_text = study.get_text(
                     " ",
                     strip=True
                 )
+
+                if study_text:
+                    studies.append(
+                        study_text
+                    )
+
+
+            # -------------------------------------------------
+            # NOTICE URL
+            # -------------------------------------------------
+
+            notice_element = block.select_one(
+                "a.btn-meeting-notice"
             )
 
+            notice_url = ""
 
-        # -----------------------------------------------------
-        # Broadcast.
-        # -----------------------------------------------------
+            if notice_element:
 
-        broadcast = ""
-
-        broadcast_element = block.select_one(
-            ".meeting-card-media-preview .stream-type"
-        )
-
-        if broadcast_element:
-
-            broadcast = clean_text(
-                broadcast_element.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-
-        # -----------------------------------------------------
-        # Studies / activities.
-        # -----------------------------------------------------
-
-        studies = []
-
-        for study in block.select(
-            ".meeting-card-studies-list "
-            ".meeting-card-study"
-        ):
-
-            study_text = clean_text(
-                study.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            if study_text:
-
-                studies.append(
-                    study_text
+                notice_url = (
+                    notice_element.get("href", "")
                 )
 
+                if notice_url.startswith("//"):
 
-        # -----------------------------------------------------
-        # Notice link.
-        # -----------------------------------------------------
+                    notice_url = (
+                        "https:" + notice_url
+                    )
 
-        notice_link = block.select_one(
-            "a.btn-meeting-notice"
-        )
+                elif notice_url.startswith("/"):
 
-        notice_url = ""
+                    notice_url = (
+                        "https://www.ourcommons.ca"
+                        + notice_url
+                    )
 
-        if (
-            notice_link
-            and notice_link.get("href")
-        ):
 
-            notice_url = urljoin(
-                BASE_URL,
-                notice_link["href"]
+            # -------------------------------------------------
+            # MEETING PAGE
+            # -------------------------------------------------
+
+            meeting_id = block.get("id", "")
+
+            meeting_page = (
+                COMMITTEE_MEETINGS_URL
             )
 
+            if meeting_id:
 
-        # -----------------------------------------------------
-        # Meeting page.
-        # -----------------------------------------------------
-
-        meeting_id = (
-            block.get("id", "")
-            .replace(
-                "collapse-meeting-",
-                ""
-            )
-        )
-
-        meeting_page = (
-            f"{MEETINGS_URL}"
-            f"#collapse-meeting-{meeting_id}"
-        )
+                meeting_page = (
+                    COMMITTEE_MEETINGS_URL
+                    + "#"
+                    + meeting_id
+                )
 
 
-        meeting = {
-            "committee": committee_name,
-            "date": meeting_date,
-            "time": time_text,
-            "location": location,
-            "broadcast": broadcast,
-            "studies": studies,
-            "meeting_page": meeting_page,
-            "notice_url": notice_url
-        }
+            # -------------------------------------------------
+            # NOTICE DETAILS
+            # -------------------------------------------------
 
-
-        # -----------------------------------------------------
-        # Read Notice of Meeting.
-        # -----------------------------------------------------
-
-        if notice_url:
-
-            notice = parse_committee_notice(
-                notice_url
-            )
-
-            meeting["notice"] = notice
-
-        else:
-
-            meeting["notice"] = {
-                "date": "",
-                "time": "",
-                "location": "",
-                "televised": False,
+            notice_details = {
                 "subject": "",
                 "witnesses": []
             }
 
+            if notice_url:
 
-        upcoming.append(
-            meeting
+                print(
+                    f"Reading Notice of Meeting for "
+                    f"{committee}..."
+                )
+
+                notice_details = (
+                    extract_notice_details(
+                        notice_url
+                    )
+                )
+
+
+            # -------------------------------------------------
+            # IMPORTANT FLAG
+            # -------------------------------------------------
+
+            meeting = {
+
+                "committee": committee,
+                "date": meeting_date,
+                "time": time_text,
+                "location": location,
+                "broadcast": broadcast,
+                "studies": studies,
+                "meeting_page": meeting_page,
+                "notice_url": notice_url,
+                "subject": notice_details.get(
+                    "subject",
+                    ""
+                ),
+                "witnesses": notice_details.get(
+                    "witnesses",
+                    []
+                )
+            }
+
+            meeting["important"] = (
+                committee_is_important(
+                    meeting
+                )
+            )
+
+            meetings.append(
+                meeting
+            )
+
+    except Exception as error:
+
+        print(
+            "Could not retrieve House of Commons "
+            "committee meetings."
         )
 
-
-    upcoming.sort(
-        key=lambda meeting: (
-            meeting["date"],
-            meeting["time"]
+        print(
+            f"Error: {error}"
         )
+
+        return []
+
+    meetings.sort(
+        key=lambda meeting: meeting["time"]
     )
 
+    print(
+        f"Today's committee meetings found: "
+        f"{len(meetings)}"
+    )
 
-    return upcoming
+    return meetings
 
 
-committee_meetings = (
-    get_upcoming_committee_meetings()
-)
+committee_meetings = get_committee_meetings()
 
 
 # ---------------------------------------------------------
@@ -780,6 +908,8 @@ all_stories = []
 
 def classify_story(title):
 
+    """Give each story a simple category."""
+
     title_lower = title.lower()
 
     if any(word in title_lower for word in [
@@ -787,9 +917,7 @@ def classify_story(title):
         "air fryer",
         "dorm-friendly"
     ]):
-
         return "lifestyle"
-
 
     if any(word in title_lower for word in [
         "letters:",
@@ -798,9 +926,7 @@ def classify_story(title):
         "column:",
         "view:"
     ]):
-
         return "opinion"
-
 
     if any(word in title_lower for word in [
         "podcast",
@@ -808,9 +934,7 @@ def classify_story(title):
         "gallery",
         "cartoonists"
     ]):
-
         return "feature"
-
 
     return "news"
 
@@ -832,28 +956,24 @@ for name, url in FEEDS.items():
 
             continue
 
-
         for article in feed.entries:
 
-            published_time = article.get(
-                "published_parsed"
+            published_time = (
+                article.get(
+                    "published_parsed"
+                )
             )
 
             if not published_time:
-
                 continue
-
 
             published = datetime(
                 *published_time[:6],
                 tzinfo=timezone.utc
             )
 
-
             if published < cutoff_time:
-
                 continue
-
 
             title = article.get(
                 "title",
@@ -865,17 +985,13 @@ for name, url in FEEDS.items():
                 ""
             )
 
-
             category = classify_story(
                 title
             )
 
-
             # MVP: only include regular news.
             if category != "news":
-
                 continue
-
 
             all_stories.append({
 
@@ -883,9 +999,7 @@ for name, url in FEEDS.items():
                 "title": title,
                 "link": link,
                 "published": published
-
             })
-
 
     except Exception as error:
 
@@ -905,12 +1019,13 @@ for name, url in FEEDS.items():
 
 stories_by_source = defaultdict(list)
 
-
 for story in all_stories:
 
     stories_by_source[
         story["source"]
-    ].append(story)
+    ].append(
+        story
+    )
 
 
 for source in stories_by_source:
@@ -925,18 +1040,14 @@ for source in stories_by_source:
 # BUILD EMAIL
 # ---------------------------------------------------------
 
-today = datetime.now(
-    ZoneInfo("America/Toronto")
-).strftime(
+today_display = datetime.now().strftime(
     "%B %-d, %Y"
 )
 
-
 message = EmailMessage()
 
-
 message["Subject"] = (
-    f"Morning News Digest — {today}"
+    f"Morning News Digest — {today_display}"
 )
 
 message["From"] = email_address
@@ -949,13 +1060,12 @@ message["To"] = email_address
 
 text_lines = []
 
-
 text_lines.append(
     "MORNING NEWS DIGEST"
 )
 
 text_lines.append(
-    today
+    today_display
 )
 
 text_lines.append("")
@@ -985,33 +1095,32 @@ if weather:
 
 
 # ---------------------------------------------------------
-# COMMITTEE WATCH
+# COMMITTEES
 # ---------------------------------------------------------
 
 if committee_meetings:
 
     text_lines.append(
-        "COMMITTEE WATCH"
+        "HOUSE OF COMMONS COMMITTEES"
     )
 
     text_lines.append("")
 
-
     for meeting in committee_meetings:
 
-        notice = meeting["notice"]
+        if meeting["important"]:
 
-
-        text_lines.append(
-            f"🏛️ {meeting['committee']}"
-        )
-
+            text_lines.append(
+                "⭐ IMPORTANT MEETING"
+            )
 
         text_lines.append(
-            f"{meeting['time']} — "
-            f"{notice['subject'] or 'Subject not listed'}"
+            f"{meeting['committee']}"
         )
 
+        text_lines.append(
+            f"🕒 {meeting['time']}"
+        )
 
         if meeting["location"]:
 
@@ -1019,29 +1128,41 @@ if committee_meetings:
                 f"📍 {meeting['location']}"
             )
 
-
-        if (
-            meeting["broadcast"]
-            or notice["televised"]
-        ):
+        if meeting["broadcast"]:
 
             text_lines.append(
-                "📺 Televised"
+                f"📺 {meeting['broadcast']}"
             )
 
+        if meeting["subject"]:
 
-        if notice["witnesses"]:
+            text_lines.append(
+                f"Subject: {meeting['subject']}"
+            )
+
+        elif meeting["studies"]:
+
+            text_lines.append(
+                "Study / Activity:"
+            )
+
+            for study in meeting["studies"]:
+
+                text_lines.append(
+                    f"  • {study}"
+                )
+
+        if meeting["witnesses"]:
 
             text_lines.append(
                 "Witnesses:"
             )
 
-            for witness in notice["witnesses"]:
+            for witness in meeting["witnesses"]:
 
                 text_lines.append(
                     f"  • {witness}"
                 )
-
 
         if meeting["notice_url"]:
 
@@ -1049,8 +1170,10 @@ if committee_meetings:
                 f"Notice: {meeting['notice_url']}"
             )
 
-
         text_lines.append("")
+
+
+    text_lines.append("")
 
 
 text_lines.append(
@@ -1061,12 +1184,15 @@ text_lines.append(
 text_lines.append("")
 
 
+# ---------------------------------------------------------
+# NEWS STORIES
+# ---------------------------------------------------------
+
 for source in sorted(
     stories_by_source
 ):
 
     text_lines.append("")
-
     text_lines.append(
         source.upper()
     )
@@ -1075,8 +1201,9 @@ for source in sorted(
         "=" * len(source)
     )
 
-
-    for story in stories_by_source[source]:
+    for story in stories_by_source[
+        source
+    ]:
 
         text_lines.append("")
 
@@ -1099,7 +1226,6 @@ plain_text = "\n".join(
 # ---------------------------------------------------------
 
 html_parts = []
-
 
 html_parts.append("""
 <!DOCTYPE html>
@@ -1133,16 +1259,14 @@ h1 {
     margin-bottom: 25px;
 }
 
-.weather,
-.committees {
+.weather {
     background-color: #f5f7f9;
     padding: 15px 18px;
     border-radius: 6px;
     margin-bottom: 25px;
 }
 
-.weather-title,
-.committee-title {
+.weather-title {
     font-size: 14px;
     font-weight: bold;
     letter-spacing: 0.5px;
@@ -1154,45 +1278,76 @@ h1 {
     margin: 5px 0;
 }
 
-.committee {
-    padding: 12px 0;
-    border-top: 1px solid #dddddd;
+.committees {
+    background-color: #f5f7f9;
+    padding: 15px 18px;
+    border-radius: 6px;
+    margin-bottom: 25px;
 }
 
-.committee:first-of-type {
+.committees-title {
+    font-size: 14px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    margin-bottom: 15px;
+}
+
+.committee {
+    border-top: 1px solid #d5d5d5;
+    padding-top: 12px;
+    margin-top: 12px;
+}
+
+.committee:first-child {
     border-top: none;
     padding-top: 0;
+    margin-top: 0;
 }
 
 .committee-name {
+    font-size: 17px;
     font-weight: bold;
-    font-size: 16px;
     margin-bottom: 5px;
 }
 
-.committee-subject {
-    font-size: 15px;
-    line-height: 1.4;
-    margin-bottom: 6px;
+.important {
+    color: #b00020;
+    font-size: 13px;
+    font-weight: bold;
+    margin-bottom: 4px;
 }
 
 .committee-detail {
     font-size: 14px;
-    color: #555555;
     margin: 3px 0;
 }
 
-.committee-link {
+.committee-subject {
     font-size: 14px;
-    margin-top: 6px;
+    margin-top: 8px;
+    line-height: 1.4;
 }
 
-.committee-link a {
+.committee-witnesses {
+    font-size: 14px;
+    margin-top: 8px;
+}
+
+.committee-witness {
+    margin: 3px 0;
+}
+
+.notice {
+    margin-top: 8px;
+}
+
+.notice a {
     color: #174a8b;
     text-decoration: none;
+    font-size: 14px;
 }
 
-.committee-link a:hover {
+.notice a:hover {
     text-decoration: underline;
 }
 
@@ -1232,9 +1387,10 @@ h1 {
 <div class="date">
 """)
 
-
 html_parts.append(
-    html.escape(today)
+    html.escape(
+        today_display
+    )
 )
 
 html_parts.append(
@@ -1277,7 +1433,7 @@ if weather:
 
 
 # ---------------------------------------------------------
-# COMMITTEE HTML
+# COMMITTEES HTML
 # ---------------------------------------------------------
 
 if committee_meetings:
@@ -1286,22 +1442,27 @@ if committee_meetings:
         """
         <div class="committees">
 
-            <div class="committee-title">
-                🏛️ COMMITTEE WATCH
+            <div class="committees-title">
+                HOUSE OF COMMONS COMMITTEES
             </div>
         """
     )
 
-
     for meeting in committee_meetings:
-
-        notice = meeting["notice"]
-
 
         html_parts.append(
             '<div class="committee">'
         )
 
+        if meeting["important"]:
+
+            html_parts.append(
+                """
+                <div class="important">
+                    ⭐ IMPORTANT MEETING
+                </div>
+                """
+            )
 
         html_parts.append(
             f"""
@@ -1311,24 +1472,13 @@ if committee_meetings:
             """
         )
 
-
-        subject = (
-            notice["subject"]
-            or "Subject not listed"
-        )
-
-
         html_parts.append(
             f"""
-            <div class="committee-subject">
-                <strong>
-                {html.escape(meeting['time'])}
-                </strong>
-                — {html.escape(subject)}
+            <div class="committee-detail">
+                🕒 {html.escape(meeting['time'])}
             </div>
             """
         )
-
 
         if meeting["location"]:
 
@@ -1340,65 +1490,87 @@ if committee_meetings:
                 """
             )
 
-
-        if (
-            meeting["broadcast"]
-            or notice["televised"]
-        ):
+        if meeting["broadcast"]:
 
             html_parts.append(
-                """
+                f"""
                 <div class="committee-detail">
-                    📺 Televised
+                    📺 {html.escape(meeting['broadcast'])}
                 </div>
                 """
             )
 
+        if meeting["subject"]:
 
-        if notice["witnesses"]:
+            html_parts.append(
+                f"""
+                <div class="committee-subject">
+                    <strong>Subject:</strong>
+                    {html.escape(meeting['subject'])}
+                </div>
+                """
+            )
+
+        elif meeting["studies"]:
 
             html_parts.append(
                 """
-                <div class="committee-detail">
+                <div class="committee-subject">
+                    <strong>Study / Activity:</strong>
+                </div>
+                """
+            )
+
+            for study in meeting["studies"]:
+
+                html_parts.append(
+                    f"""
+                    <div class="committee-detail">
+                        • {html.escape(study)}
+                    </div>
+                    """
+                )
+
+        if meeting["witnesses"]:
+
+            html_parts.append(
+                """
+                <div class="committee-witnesses">
                     <strong>Witnesses:</strong>
                 </div>
                 """
             )
 
-
-            for witness in notice["witnesses"]:
+            for witness in meeting["witnesses"]:
 
                 html_parts.append(
                     f"""
-                    <div class="committee-detail">
+                    <div class="committee-witness">
                         • {html.escape(witness)}
                     </div>
                     """
                 )
 
-
         if meeting["notice_url"]:
 
-            safe_notice_url = html.escape(
+            notice_link = html.escape(
                 meeting["notice_url"],
                 quote=True
             )
 
             html_parts.append(
                 f"""
-                <div class="committee-link">
-                    <a href="{safe_notice_url}">
-                        Notice of Meeting →
+                <div class="notice">
+                    <a href="{notice_link}">
+                        View Notice of Meeting →
                     </a>
                 </div>
                 """
             )
 
-
         html_parts.append(
             "</div>"
         )
-
 
     html_parts.append(
         "</div>"
@@ -1406,7 +1578,7 @@ if committee_meetings:
 
 
 # ---------------------------------------------------------
-# NEWS COUNT
+# STORY COUNT
 # ---------------------------------------------------------
 
 html_parts.append(
@@ -1416,7 +1588,7 @@ html_parts.append(
 
 
 # ---------------------------------------------------------
-# NEWS STORIES
+# NEWS STORIES HTML
 # ---------------------------------------------------------
 
 for source in sorted(
@@ -1429,8 +1601,9 @@ for source in sorted(
         f'</div>'
     )
 
-
-    for story in stories_by_source[source]:
+    for story in stories_by_source[
+        source
+    ]:
 
         title = html.escape(
             story["title"]
@@ -1440,7 +1613,6 @@ for source in sorted(
             story["link"],
             quote=True
         )
-
 
         html_parts.append(
             f"""
@@ -1497,6 +1669,7 @@ with smtplib.SMTP_SSL(
 
 print(
     f"Digest sent successfully! "
-    f"{len(all_stories)} news stories included. "
-    f"{len(committee_meetings)} committee meetings included."
+    f"{len(all_stories)} news stories included "
+    f"and {len(committee_meetings)} committee "
+    f"meetings included."
 )
