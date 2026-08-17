@@ -28,7 +28,10 @@ app_password = os.environ["EMAIL_APP_PASSWORD"]
 
 
 # Look back 30 hours.
-cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
+cutoff_time = (
+    datetime.now(timezone.utc)
+    - timedelta(hours=30)
+)
 
 
 # ---------------------------------------------------------
@@ -156,6 +159,7 @@ weather = get_ottawa_weather()
 # ---------------------------------------------------------
 
 BASE_URL = "https://www.ourcommons.ca"
+
 MEETINGS_URL = (
     "https://www.ourcommons.ca/committees/en/Meetings"
 )
@@ -231,6 +235,11 @@ def parse_committee_notice(notice_url):
         if clean_text(line)
     ]
 
+
+    # -----------------------------------------------------
+    # DATE
+    # -----------------------------------------------------
+
     date_value = ""
 
     date_pattern = re.compile(
@@ -246,9 +255,12 @@ def parse_committee_notice(notice_url):
         if date_pattern.match(line):
 
             date_value = line
-
             break
 
+
+    # -----------------------------------------------------
+    # TIME
+    # -----------------------------------------------------
 
     time_value = ""
 
@@ -263,9 +275,12 @@ def parse_committee_notice(notice_url):
         if time_pattern.match(line):
 
             time_value = line
-
             break
 
+
+    # -----------------------------------------------------
+    # LOCATION
+    # -----------------------------------------------------
 
     location_value = ""
 
@@ -280,9 +295,12 @@ def parse_committee_notice(notice_url):
         ):
 
             location_value = line
-
             break
 
+
+    # -----------------------------------------------------
+    # TELEVISED
+    # -----------------------------------------------------
 
     televised = any(
         line.lower() == "televised"
@@ -290,8 +308,10 @@ def parse_committee_notice(notice_url):
     )
 
 
-    # The subject appears immediately before
-    # "Committee clerk" on the notice.
+    # -----------------------------------------------------
+    # SUBJECT
+    # -----------------------------------------------------
+
     subject = ""
 
     clerk_index = None
@@ -301,7 +321,6 @@ def parse_committee_notice(notice_url):
         if line.lower() == "committee clerk":
 
             clerk_index = i
-
             break
 
 
@@ -340,7 +359,6 @@ def parse_committee_notice(notice_url):
         ):
 
             witness_index = i
-
             break
 
 
@@ -434,7 +452,6 @@ def get_upcoming_committee_meetings():
         ZoneInfo("America/Toronto")
     ).date()
 
-
     upcoming = []
 
 
@@ -527,34 +544,42 @@ def get_upcoming_committee_meetings():
 
                 pass
 
+
         # -----------------------------------------------------
-        # Upcoming meetings sometimes say "Today" or "Tomorrow"
-        # rather than giving the date.
+        # The House page sometimes uses relative labels:
+        #
+        #   Later Today
+        #   Today
+        #   Tomorrow
+        #
+        # "Earlier Today" should NOT count as upcoming.
         # -----------------------------------------------------
 
         if meeting_date is None:
-    
-            for parent in block.parents:
-        
-                if parent is None:
-                    break
 
-                text = clean_text(
-                    parent.get_text(
-                        " ",
-                        strip=True
-                    )
+            block_text = clean_text(
+                block.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+            if "Later Today" in block_text:
+
+                meeting_date = today
+
+            elif "Tomorrow" in block_text:
+
+                meeting_date = (
+                    today + timedelta(days=1)
                 )
 
-        if "Today" in text:
-            meeting_date = today
-            break
+            elif (
+                "Today" in block_text
+                and "Earlier Today" not in block_text
+            ):
 
-        if "Tomorrow" in text:
-            meeting_date = (
-                today + timedelta(days=1)
-            )
-            break
+                meeting_date = today
 
 
         if meeting_date is None:
@@ -835,7 +860,6 @@ for name, url in FEEDS.items():
                 "No title"
             )
 
-
             link = article.get(
                 "link",
                 ""
@@ -854,10 +878,12 @@ for name, url in FEEDS.items():
 
 
             all_stories.append({
+
                 "source": name,
                 "title": title,
                 "link": link,
                 "published": published
+
             })
 
 
@@ -912,7 +938,6 @@ message = EmailMessage()
 message["Subject"] = (
     f"Morning News Digest — {today}"
 )
-
 
 message["From"] = email_address
 message["To"] = email_address
@@ -980,6 +1005,7 @@ if committee_meetings:
         text_lines.append(
             f"🏛️ {meeting['committee']}"
         )
+
 
         text_lines.append(
             f"{meeting['time']} — "
@@ -1338,6 +1364,7 @@ if committee_meetings:
                 </div>
                 """
             )
+
 
             for witness in notice["witnesses"]:
 
