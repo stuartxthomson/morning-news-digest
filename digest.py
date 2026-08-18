@@ -4,7 +4,6 @@ import os
 import smtplib
 import html
 import urllib.request
-import urllib.parse
 import json
 import re
 import requests
@@ -13,6 +12,7 @@ from bs4 import BeautifulSoup
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo
 
 from sources import FEEDS
 
@@ -28,6 +28,14 @@ socket.setdefaulttimeout(10)
 email_address = os.environ["EMAIL_ADDRESS"]
 app_password = os.environ["EMAIL_APP_PASSWORD"]
 
+# IMPORTANT:
+# GitHub Actions runs in UTC, but the digest is an Ottawa
+# product. Always determine "today" using Ottawa/Toronto time.
+TORONTO_TZ = ZoneInfo("America/Toronto")
+
+now_toronto = datetime.now(TORONTO_TZ)
+today_toronto = now_toronto.date()
+
 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
 
 HEADERS = {
@@ -42,11 +50,6 @@ HEADERS = {
 # ---------------------------------------------------------
 
 def get_ottawa_weather():
-    """
-    Get Ottawa's 7 a.m. forecast from Open-Meteo.
-
-    No API key or account is required.
-    """
 
     weather_url = (
         "https://api.open-meteo.com/v1/forecast"
@@ -171,11 +174,7 @@ COMMITTEE_MEETINGS_URL = (
 def parse_committee_date(text):
 
     """
-    Extract a date from a meeting card.
-
-    This deliberately looks for the actual date rather than
-    relying on labels such as 'Tomorrow', 'Later Today',
-    or 'Earlier Today'.
+    Extract an explicit date from text.
     """
 
     if not text:
@@ -218,33 +217,103 @@ def parse_committee_date(text):
 
         try:
 
-            if match.group("month").isdigit():
+            month_value = match.group("month")
+
+            if month_value.isdigit():
 
                 return datetime(
                     int(match.group("year")),
-                    int(match.group("month")),
+                    int(month_value),
                     int(match.group("day"))
                 ).date()
 
-            else:
+            month_number = datetime.strptime(
+                month_value.capitalize(),
+                "%B"
+            ).month
 
-                month_name = (
-                    match.group("month").capitalize()
-                )
-
-                month_number = datetime.strptime(
-                    month_name,
-                    "%B"
-                ).month
-
-                return datetime(
-                    int(match.group("year")),
-                    month_number,
-                    int(match.group("day"))
-                ).date()
+            return datetime(
+                int(match.group("year")),
+                month_number,
+                int(match.group("day"))
+            ).date()
 
         except ValueError:
+
             return None
+
+    return None
+
+
+def infer_relative_meeting_date(block):
+
+    """
+    The House committee page sometimes replaces an explicit
+    date with labels such as:
+
+        Tomorrow
+        Later Today
+        Earlier Today
+
+    Try to find those labels in the meeting block or its
+    nearby container.
+
+    Returns:
+        date, or None if we cannot determine it.
+    """
+
+    possible_text = []
+
+    # The block itself.
+    possible_text.append(
+        block.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    # Look at several levels of surrounding HTML. The
+    # relative-date label may live outside the collapsed
+    # meeting block.
+    ancestor = block.parent
+
+    for _ in range(4):
+
+        if ancestor is None:
+            break
+
+        possible_text.append(
+            ancestor.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        ancestor = ancestor.parent
+
+    combined_text = " ".join(
+        possible_text
+    )
+
+    combined_lower = combined_text.lower()
+
+    # These labels mean the meeting belongs to today.
+    today_labels = [
+        "later today",
+        "earlier today",
+        "today"
+    ]
+
+    for label in today_labels:
+
+        if label in combined_lower:
+
+            return today_toronto
+
+    # Tomorrow should NOT be included in today's digest.
+    if "tomorrow" in combined_lower:
+
+        return today_toronto + timedelta(days=1)
 
     return None
 
@@ -252,8 +321,8 @@ def parse_committee_date(text):
 def extract_notice_details(notice_url):
 
     """
-    Read the Notice of Meeting and extract the subject and
-    witnesses.
+    Read the Notice of Meeting and extract the subject
+    and witnesses.
     """
 
     details = {
@@ -285,61 +354,59 @@ def extract_notice_details(notice_url):
         # SUBJECT
         # -------------------------------------------------
 
-        subject_markers = [
-            "Meeting Requested Pursuant to",
-            "Study of",
-            "Subject:"
-        ]
-
         subject = ""
 
-        for marker in subject_markers:
+        # The House notice normally contains a long line
+        # beginning with "Meeting Requested..." or a similar
+        # description.
+        for element in soup.find_all(
+            string=re.compile(
+                r"Meeting Requested Pursuant",
+                re.IGNORECASE
+            )
+        ):
 
-            index = text.find(marker)
+            candidate = element.parent.get_text(
+                " ",
+                strip=True
+            )
 
-            if index >= 0:
+            if candidate and len(candidate) > 20:
 
-                possible = text[index:]
+                subject = candidate
+                break
 
-                lines = [
-                    line.strip()
-                    for line in possible.splitlines()
-                    if line.strip()
-                ]
-
-                if lines:
-
-                    for line in lines[:5]:
-
-                        if (
-                            "Committee clerk" not in line
-                            and "2026-" not in line
-                            and len(line) > 20
-                        ):
-                            subject = line
-                            break
-
-                if subject:
-                    break
-
-        # A more precise fallback for the common House format.
+        # General fallback.
         if not subject:
 
-            for element in soup.find_all(
-                string=re.compile(
-                    r"Meeting Requested Pursuant",
-                    re.IGNORECASE
-                )
-            ):
+            lines = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip()
+            ]
 
-                parent_text = element.parent.get_text(
-                    " ",
-                    strip=True
-                )
+            for i, line in enumerate(lines):
 
-                if parent_text:
-                    subject = parent_text
-                    break
+                if (
+                    "Meeting Requested Pursuant" in line
+                    or line.lower() == "subject:"
+                ):
+
+                    for candidate in lines[i:i + 5]:
+
+                        if (
+                            len(candidate) > 20
+                            and "Committee clerk"
+                            not in candidate
+                            and "Notice of meeting"
+                            not in candidate
+                        ):
+
+                            subject = candidate
+                            break
+
+                    if subject:
+                        break
 
         details["subject"] = subject
 
@@ -348,8 +415,6 @@ def extract_notice_details(notice_url):
         # WITNESSES
         # -------------------------------------------------
 
-        # Witnesses may appear under headings such as
-        # "Witnesses" or "Appearing".
         witness_heading = None
 
         for heading in soup.find_all(
@@ -373,7 +438,6 @@ def extract_notice_details(notice_url):
 
         if witness_heading:
 
-            # Collect nearby list items.
             parent = witness_heading.parent
 
             if parent:
@@ -390,7 +454,8 @@ def extract_notice_details(notice_url):
                             witness
                         )
 
-        # Second approach: inspect text after "Witnesses".
+        # Second approach: inspect lines following
+        # "Witnesses".
         if not details["witnesses"]:
 
             lines = [
@@ -415,7 +480,7 @@ def extract_notice_details(notice_url):
 
                 for line in lines[
                     witness_index + 1:
-                    witness_index + 15
+                    witness_index + 20
                 ]:
 
                     if line.lower() in [
@@ -423,19 +488,29 @@ def extract_notice_details(notice_url):
                         "evidence",
                         "minutes of proceedings"
                     ]:
+
                         break
 
                     if len(line) > 2:
-                        details["witnesses"].append(
-                            line
-                        )
 
-        # Remove obvious duplicates.
+                        # Avoid obvious page/navigation text.
+                        if line not in [
+                            "Watch on ParlVU",
+                            "Notice of meeting",
+                            "Meetings"
+                        ]:
+
+                            details["witnesses"].append(
+                                line
+                            )
+
+        # Remove duplicates and obvious false positives.
         cleaned_witnesses = []
 
         for witness in details["witnesses"]:
 
             if witness not in cleaned_witnesses:
+
                 cleaned_witnesses.append(
                     witness
                 )
@@ -528,23 +603,29 @@ def committee_is_important(meeting):
 def get_committee_meetings():
 
     """
-    Retrieve all House of Commons committee meetings whose
-    actual meeting date is TODAY.
+    Retrieve House of Commons committee meetings occurring
+    TODAY in Ottawa/Toronto time.
 
-    Important:
-    We do NOT use 'Tomorrow', 'Later Today', or
-    'Earlier Today' to determine whether a meeting belongs
-    in the digest.
+    We deliberately handle:
 
-    We look for the actual date in each meeting block.
+        - explicit dates
+        - Later Today
+        - Earlier Today
+        - Today
+        - Tomorrow
+
+    This is important because the House page can change a
+    meeting's label during the day.
     """
 
     meetings = []
 
-    today = datetime.now().date()
-
     print("")
     print("Checking House of Commons committees...")
+    print(
+        f"Committee date we're looking for: "
+        f"{today_toronto}"
+    )
 
     try:
 
@@ -582,14 +663,20 @@ def get_committee_meetings():
             status = ""
 
             if status_element:
+
                 status = status_element.get_text(
                     " ",
                     strip=True
                 ).lower()
 
-            # Suspended meetings are historical meetings,
-            # even though they may still appear on the page.
+            # Suspended meetings are historical, even though
+            # they remain on the page.
             if "suspended" in status:
+
+                print(
+                    "Skipping suspended meeting."
+                )
+
                 continue
 
 
@@ -611,7 +698,7 @@ def get_committee_meetings():
 
 
             # -------------------------------------------------
-            # ACTUAL DATE
+            # DATE / TIME
             # -------------------------------------------------
 
             date_element = block.select_one(
@@ -626,13 +713,27 @@ def get_committee_meetings():
                 strip=True
             )
 
+            # First try an explicit date.
             meeting_date = parse_committee_date(
                 date_text
             )
 
-            # Some current meetings omit the date from the
-            # visible time, so inspect the entire block as a
-            # fallback.
+            date_source = "explicit date"
+
+            # If the card doesn't contain the date, look for
+            # relative labels.
+            if meeting_date is None:
+
+                meeting_date = (
+                    infer_relative_meeting_date(
+                        block
+                    )
+                )
+
+                date_source = "relative label"
+
+            # If that still fails, inspect the broader
+            # meeting block.
             if meeting_date is None:
 
                 block_text = block.get_text(
@@ -644,19 +745,31 @@ def get_committee_meetings():
                     block_text
                 )
 
-            # If we cannot establish the actual date, do not
-            # guess.
+                date_source = "block text"
+
+            # Never guess.
             if meeting_date is None:
+
+                print(
+                    f"Could not determine date for "
+                    f"{committee}. Skipping."
+                )
+
                 continue
 
-            # THIS IS THE IMPORTANT FIX.
-            #
-            # We compare the actual date with today's date.
-            #
-            # Therefore a meeting remains eligible after its
-            # label changes from "Later Today" to
-            # "Earlier Today".
-            if meeting_date != today:
+            print(
+                f"{committee}: {meeting_date} "
+                f"({date_source})"
+            )
+
+            # This is the key test.
+            if meeting_date != today_toronto:
+
+                print(
+                    f"Skipping {committee}: "
+                    f"not today's meeting."
+                )
+
                 continue
 
 
@@ -666,7 +779,7 @@ def get_committee_meetings():
 
             time_text = date_text
 
-            # Remove date if present.
+            # Remove explicit date if present.
             time_text = re.sub(
                 r"""
                 (?P<month>
@@ -712,36 +825,39 @@ def get_committee_meetings():
 
             broadcast = ""
 
-            broadcast_element = block.select_one(
-                ".meeting-card-media-preview .stream-type"
+            attributes = block.select(
+                ".meeting-card-attribute"
             )
 
-            if broadcast_element:
+            for attribute in attributes:
 
-                broadcast = broadcast_element.get_text(
+                attribute_text = attribute.get_text(
                     " ",
                     strip=True
                 )
 
-            else:
+                if "Televised" in attribute_text:
 
-                # Look for the television attribute.
-                attributes = block.select(
-                    ".meeting-card-attribute"
+                    broadcast = "Televised"
+                    break
+
+            if not broadcast:
+
+                broadcast_element = (
+                    block.select_one(
+                        ".meeting-card-media-preview "
+                        ".stream-type"
+                    )
                 )
 
-                for attribute in attributes:
+                if broadcast_element:
 
-                    attribute_text = attribute.get_text(
-                        " ",
-                        strip=True
+                    broadcast = (
+                        broadcast_element.get_text(
+                            " ",
+                            strip=True
+                        )
                     )
-
-                    if "Televised" in attribute_text:
-
-                        broadcast = "Televised"
-
-                        break
 
 
             # -------------------------------------------------
@@ -760,6 +876,7 @@ def get_committee_meetings():
                 )
 
                 if study_text:
+
                     studies.append(
                         study_text
                     )
@@ -778,7 +895,10 @@ def get_committee_meetings():
             if notice_element:
 
                 notice_url = (
-                    notice_element.get("href", "")
+                    notice_element.get(
+                        "href",
+                        ""
+                    )
                 )
 
                 if notice_url.startswith("//"):
@@ -799,7 +919,10 @@ def get_committee_meetings():
             # MEETING PAGE
             # -------------------------------------------------
 
-            meeting_id = block.get("id", "")
+            meeting_id = block.get(
+                "id",
+                ""
+            )
 
             meeting_page = (
                 COMMITTEE_MEETINGS_URL
@@ -838,23 +961,32 @@ def get_committee_meetings():
 
 
             # -------------------------------------------------
-            # IMPORTANT FLAG
+            # BUILD MEETING
             # -------------------------------------------------
 
             meeting = {
 
                 "committee": committee,
+
                 "date": meeting_date,
+
                 "time": time_text,
+
                 "location": location,
+
                 "broadcast": broadcast,
+
                 "studies": studies,
+
                 "meeting_page": meeting_page,
+
                 "notice_url": notice_url,
+
                 "subject": notice_details.get(
                     "subject",
                     ""
                 ),
+
                 "witnesses": notice_details.get(
                     "witnesses",
                     []
@@ -871,6 +1003,7 @@ def get_committee_meetings():
                 meeting
             )
 
+
     except Exception as error:
 
         print(
@@ -884,6 +1017,8 @@ def get_committee_meetings():
 
         return []
 
+
+    # Keep chronological order.
     meetings.sort(
         key=lambda meeting: meeting["time"]
     )
@@ -908,8 +1043,6 @@ all_stories = []
 
 def classify_story(title):
 
-    """Give each story a simple category."""
-
     title_lower = title.lower()
 
     if any(word in title_lower for word in [
@@ -917,6 +1050,7 @@ def classify_story(title):
         "air fryer",
         "dorm-friendly"
     ]):
+
         return "lifestyle"
 
     if any(word in title_lower for word in [
@@ -926,6 +1060,7 @@ def classify_story(title):
         "column:",
         "view:"
     ]):
+
         return "opinion"
 
     if any(word in title_lower for word in [
@@ -934,6 +1069,7 @@ def classify_story(title):
         "gallery",
         "cartoonists"
     ]):
+
         return "feature"
 
     return "news"
@@ -945,7 +1081,9 @@ for name, url in FEEDS.items():
 
     try:
 
-        feed = feedparser.parse(url)
+        feed = feedparser.parse(
+            url
+        )
 
         if feed.bozo and not feed.entries:
 
@@ -989,15 +1127,18 @@ for name, url in FEEDS.items():
                 title
             )
 
-            # MVP: only include regular news.
+            # Only regular news.
             if category != "news":
                 continue
 
             all_stories.append({
 
                 "source": name,
+
                 "title": title,
+
                 "link": link,
+
                 "published": published
             })
 
@@ -1017,7 +1158,9 @@ for name, url in FEEDS.items():
 # GROUP STORIES BY SOURCE
 # ---------------------------------------------------------
 
-stories_by_source = defaultdict(list)
+stories_by_source = defaultdict(
+    list
+)
 
 for story in all_stories:
 
@@ -1040,14 +1183,15 @@ for source in stories_by_source:
 # BUILD EMAIL
 # ---------------------------------------------------------
 
-today_display = datetime.now().strftime(
+today_display = now_toronto.strftime(
     "%B %-d, %Y"
 )
 
 message = EmailMessage()
 
 message["Subject"] = (
-    f"Morning News Digest — {today_display}"
+    f"Morning News Digest — "
+    f"{today_display}"
 )
 
 message["From"] = email_address
@@ -1115,7 +1259,7 @@ if committee_meetings:
             )
 
         text_lines.append(
-            f"{meeting['committee']}"
+            meeting["committee"]
         )
 
         text_lines.append(
@@ -1167,11 +1311,11 @@ if committee_meetings:
         if meeting["notice_url"]:
 
             text_lines.append(
-                f"Notice: {meeting['notice_url']}"
+                f"Notice: "
+                f"{meeting['notice_url']}"
             )
 
         text_lines.append("")
-
 
     text_lines.append("")
 
@@ -1467,7 +1611,9 @@ if committee_meetings:
         html_parts.append(
             f"""
             <div class="committee-name">
-                {html.escape(meeting['committee'])}
+                {html.escape(
+                    meeting['committee']
+                )}
             </div>
             """
         )
@@ -1475,7 +1621,9 @@ if committee_meetings:
         html_parts.append(
             f"""
             <div class="committee-detail">
-                🕒 {html.escape(meeting['time'])}
+                🕒 {html.escape(
+                    meeting['time']
+                )}
             </div>
             """
         )
@@ -1485,7 +1633,9 @@ if committee_meetings:
             html_parts.append(
                 f"""
                 <div class="committee-detail">
-                    📍 {html.escape(meeting['location'])}
+                    📍 {html.escape(
+                        meeting['location']
+                    )}
                 </div>
                 """
             )
@@ -1495,7 +1645,9 @@ if committee_meetings:
             html_parts.append(
                 f"""
                 <div class="committee-detail">
-                    📺 {html.escape(meeting['broadcast'])}
+                    📺 {html.escape(
+                        meeting['broadcast']
+                    )}
                 </div>
                 """
             )
@@ -1506,7 +1658,9 @@ if committee_meetings:
                 f"""
                 <div class="committee-subject">
                     <strong>Subject:</strong>
-                    {html.escape(meeting['subject'])}
+                    {html.escape(
+                        meeting['subject']
+                    )}
                 </div>
                 """
             )
@@ -1516,7 +1670,9 @@ if committee_meetings:
             html_parts.append(
                 """
                 <div class="committee-subject">
-                    <strong>Study / Activity:</strong>
+                    <strong>
+                        Study / Activity:
+                    </strong>
                 </div>
                 """
             )
