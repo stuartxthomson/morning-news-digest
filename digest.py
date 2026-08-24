@@ -1045,12 +1045,15 @@ def classify_story(title):
 
     title_lower = title.lower()
 
+    # ---------------------------------------------------------
+    # OBVIOUS NON-NEWS / NON-POLITICAL CONTENT
+    # ---------------------------------------------------------
+
     if any(word in title_lower for word in [
         "recipe",
         "air fryer",
         "dorm-friendly"
     ]):
-
         return "lifestyle"
 
     if any(word in title_lower for word in [
@@ -1060,7 +1063,6 @@ def classify_story(title):
         "column:",
         "view:"
     ]):
-
         return "opinion"
 
     if any(word in title_lower for word in [
@@ -1069,10 +1071,189 @@ def classify_story(title):
         "gallery",
         "cartoonists"
     ]):
-
         return "feature"
 
-    return "news"
+
+    # ---------------------------------------------------------
+    # POLITICAL RELEVANCE SCORING
+    # ---------------------------------------------------------
+
+    political_score = 0
+
+    # Strong political signals
+    strong_terms = [
+        "prime minister",
+        "parliament",
+        "house of commons",
+        "senate",
+        "cabinet",
+        "minister",
+        "mp ",
+        "mps ",
+        "member of parliament",
+        "conservative party",
+        "liberal party",
+        "ndp",
+        "bloc québécois",
+        "bloc quebecois",
+        "green party",
+        "new democratic party",
+        "political party",
+        "opposition",
+        "caucus",
+        "election",
+        "elections",
+        "by-election",
+        "byelection",
+        "legislation",
+        "bill ",
+        "confidence vote",
+        "throne speech",
+        "budget",
+        "government",
+        "federal government",
+        "privy council",
+        "elections canada"
+    ]
+
+    # Canadian political figures
+    politician_terms = [
+        "mark carney",
+        "pierre poilievre",
+        "danielle smith",
+        "jagmeet singh",
+        "yves-françois blanchet",
+        "yves-francois blanchet",
+        "elizabeth may",
+        "donald trump",
+        "justin trudeau",
+        "christia freeland",
+        "melanie joly",
+        "dominique leblanc",
+        "françois-philippe champagne",
+        "francois-philippe champagne"
+    ]
+
+    # Major political/public-policy subjects
+    policy_terms = [
+        "tariff",
+        "tariffs",
+        "trade deal",
+        "trade talks",
+        "trade negotiations",
+        "immigration",
+        "asylum",
+        "refugee",
+        "border",
+        "foreign interference",
+        "national security",
+        "defence",
+        "defense",
+        "military",
+        "nato",
+        "crime bill",
+        "gun control",
+        "firearms",
+        "carbon tax",
+        "carbon pricing",
+        "tax hike",
+        "tax cut",
+        "taxes",
+        "health transfer",
+        "equalization",
+        "pipeline",
+        "energy policy",
+        "oil and gas",
+        "climate policy",
+        "artificial intelligence policy",
+        "housing policy",
+        "affordable housing",
+        "indigenous affairs",
+        "first nations",
+        "supreme court",
+        "rcmp",
+        "public safety",
+        "foreign policy"
+    ]
+
+    # Political institutions / government departments
+    institution_terms = [
+        "ottawa",
+        "parliament hill",
+        "treasury board",
+        "finance canada",
+        "global affairs canada",
+        "public safety canada",
+        "immigration, refugees and citizenship canada",
+        "ircc",
+        "department of national defence",
+        "national defence",
+        "house committee",
+        "parliamentary committee",
+        "committee hearing"
+    ]
+
+
+    # ---------------------------------------------------------
+    # CALCULATE SCORE
+    # ---------------------------------------------------------
+
+    for term in strong_terms:
+        if term in title_lower:
+            political_score += 3
+
+    for term in politician_terms:
+        if term in title_lower:
+            political_score += 4
+
+    for term in policy_terms:
+        if term in title_lower:
+            political_score += 2
+
+    for term in institution_terms:
+        if term in title_lower:
+            political_score += 1
+
+
+    # ---------------------------------------------------------
+    # SPECIAL CASES
+    # ---------------------------------------------------------
+
+    # Stories about Trump are often political, but we don't want
+    # every Trump story unless there is a Canadian angle.
+    if "trump" in title_lower:
+        canadian_angle_terms = [
+            "canada",
+            "canadian",
+            "carney",
+            "poilievre",
+            "ottawa",
+            "tariff",
+            "tariffs",
+            "trade",
+            "border",
+            "north america",
+            "mexico",
+            "usmca",
+            "cusma"
+        ]
+
+        if any(term in title_lower for term in canadian_angle_terms):
+            political_score += 3
+        else:
+            political_score -= 2
+
+
+    # ---------------------------------------------------------
+    # FINAL CLASSIFICATION
+    # ---------------------------------------------------------
+
+    if political_score >= 3:
+        print(f"✓ POLITICAL ({political_score}): {title}")
+        return "news"
+
+    print(f"✗ NON-POLITICAL ({political_score}): {title}")
+    return "non_political"
 
 
 for name, url in FEEDS.items():
