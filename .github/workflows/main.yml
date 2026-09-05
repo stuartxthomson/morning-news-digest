@@ -6,11 +6,18 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  digest:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
+      - name: Show start time
+        run: |
+          echo "GitHub UTC time:"
+          date -u
+          echo "Toronto time:"
+          TZ=America/Toronto date
+
       - name: Get my code
         uses: actions/checkout@v5
 
