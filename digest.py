@@ -1,5 +1,4 @@
 import feedparser
-import socket
 import os
 import smtplib
 import html
@@ -7,9 +6,11 @@ import urllib.request
 import json
 import re
 import requests
+import time
 
 from bs4 import BeautifulSoup
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
@@ -17,26 +18,20 @@ from zoneinfo import ZoneInfo
 from sources import FEEDS
 
 
-# Don't wait forever if a website doesn't respond.
-socket.setdefaulttimeout(10)
+# =========================================================
+# RUNTIME / NETWORK SETTINGS
+# =========================================================
 
+SCRIPT_START = time.perf_counter()
 
-# ---------------------------------------------------------
-# SETTINGS
-# ---------------------------------------------------------
-
-email_address = os.environ["EMAIL_ADDRESS"]
-app_password = os.environ["EMAIL_APP_PASSWORD"]
-
-# IMPORTANT:
-# GitHub Actions runs in UTC, but the digest is an Ottawa
-# product. Always determine "today" using Ottawa/Toronto time.
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
-now_toronto = datetime.now(TORONTO_TZ)
-today_toronto = now_toronto.date()
-
-cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
+# Hard limits. A slow site gets skipped rather than holding
+# up the entire digest.
+FEED_TIMEOUT = 12
+WEATHER_TIMEOUT = 10
+COMMITTEE_TIMEOUT = 15
+NOTICE_TIMEOUT = 10
 
 HEADERS = {
     "User-Agent": (
@@ -45,9 +40,34 @@ HEADERS = {
 }
 
 
-# ---------------------------------------------------------
+def elapsed():
+    return time.perf_counter() - SCRIPT_START
+
+
+def log(message):
+    print(f"[{elapsed():6.1f}s] {message}")
+
+
+log("Digest starting.")
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+email_address = os.environ["EMAIL_ADDRESS"]
+app_password = os.environ["EMAIL_APP_PASSWORD"]
+
+now_toronto = datetime.now(TORONTO_TZ)
+today_toronto = now_toronto.date()
+
+# Keep your existing 30-hour window.
+cutoff_time = datetime.now(timezone.utc) - timedelta(hours=30)
+
+
+# =========================================================
 # OTTAWA WEATHER
-# ---------------------------------------------------------
+# =========================================================
 
 def get_ottawa_weather():
 
@@ -72,7 +92,7 @@ def get_ottawa_weather():
 
         with urllib.request.urlopen(
             request,
-            timeout=10
+            timeout=WEATHER_TIMEOUT
         ) as response:
 
             data = response.read().decode("utf-8")
@@ -84,9 +104,9 @@ def get_ottawa_weather():
 
         morning_index = None
 
-        for i, time in enumerate(hourly["time"]):
+        for i, forecast_time in enumerate(hourly["time"]):
 
-            if time.endswith("T07:00"):
+            if forecast_time.endswith("T07:00"):
                 morning_index = i
                 break
 
@@ -159,12 +179,14 @@ def get_ottawa_weather():
         return None
 
 
+log("Checking Ottawa weather...")
 weather = get_ottawa_weather()
+log("Weather check complete.")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # COMMITTEE SCRAPER
-# ---------------------------------------------------------
+# =========================================================
 
 COMMITTEE_MEETINGS_URL = (
     "https://www.ourcommons.ca/committees/en/Meetings"
@@ -172,10 +194,6 @@ COMMITTEE_MEETINGS_URL = (
 
 
 def parse_committee_date(text):
-
-    """
-    Extract an explicit date from text.
-    """
 
     if not text:
         return None
@@ -247,24 +265,8 @@ def parse_committee_date(text):
 
 def infer_relative_meeting_date(block):
 
-    """
-    The House committee page sometimes replaces an explicit
-    date with labels such as:
-
-        Tomorrow
-        Later Today
-        Earlier Today
-
-    Try to find those labels in the meeting block or its
-    nearby container.
-
-    Returns:
-        date, or None if we cannot determine it.
-    """
-
     possible_text = []
 
-    # The block itself.
     possible_text.append(
         block.get_text(
             " ",
@@ -272,9 +274,6 @@ def infer_relative_meeting_date(block):
         )
     )
 
-    # Look at several levels of surrounding HTML. The
-    # relative-date label may live outside the collapsed
-    # meeting block.
     ancestor = block.parent
 
     for _ in range(4):
@@ -297,20 +296,16 @@ def infer_relative_meeting_date(block):
 
     combined_lower = combined_text.lower()
 
-    # These labels mean the meeting belongs to today.
-    today_labels = [
+    for label in [
         "later today",
         "earlier today",
         "today"
-    ]
-
-    for label in today_labels:
+    ]:
 
         if label in combined_lower:
 
             return today_toronto
 
-    # Tomorrow should NOT be included in today's digest.
     if "tomorrow" in combined_lower:
 
         return today_toronto + timedelta(days=1)
@@ -319,11 +314,6 @@ def infer_relative_meeting_date(block):
 
 
 def extract_notice_details(notice_url):
-
-    """
-    Read the Notice of Meeting and extract the subject
-    and witnesses.
-    """
 
     details = {
         "subject": "",
@@ -335,7 +325,7 @@ def extract_notice_details(notice_url):
         response = requests.get(
             notice_url,
             headers=HEADERS,
-            timeout=15
+            timeout=NOTICE_TIMEOUT
         )
 
         response.raise_for_status()
@@ -356,9 +346,6 @@ def extract_notice_details(notice_url):
 
         subject = ""
 
-        # The House notice normally contains a long line
-        # beginning with "Meeting Requested..." or a similar
-        # description.
         for element in soup.find_all(
             string=re.compile(
                 r"Meeting Requested Pursuant",
@@ -376,7 +363,6 @@ def extract_notice_details(notice_url):
                 subject = candidate
                 break
 
-        # General fallback.
         if not subject:
 
             lines = [
@@ -409,7 +395,6 @@ def extract_notice_details(notice_url):
                         break
 
         details["subject"] = subject
-
 
         # -------------------------------------------------
         # WITNESSES
@@ -450,12 +435,11 @@ def extract_notice_details(notice_url):
                     )
 
                     if witness:
+
                         details["witnesses"].append(
                             witness
                         )
 
-        # Second approach: inspect lines following
-        # "Witnesses".
         if not details["witnesses"]:
 
             lines = [
@@ -493,7 +477,6 @@ def extract_notice_details(notice_url):
 
                     if len(line) > 2:
 
-                        # Avoid obvious page/navigation text.
                         if line not in [
                             "Watch on ParlVU",
                             "Notice of meeting",
@@ -504,7 +487,6 @@ def extract_notice_details(notice_url):
                                 line
                             )
 
-        # Remove duplicates and obvious false positives.
         cleaned_witnesses = []
 
         for witness in details["witnesses"]:
@@ -532,11 +514,6 @@ def extract_notice_details(notice_url):
 
 def committee_is_important(meeting):
 
-    """
-    Flag meetings likely to be particularly useful to
-    a political-news digest.
-    """
-
     subject = (
         meeting.get("subject", "")
         .lower()
@@ -552,7 +529,6 @@ def committee_is_important(meeting):
 
     important_terms = [
 
-        # People / government
         "minister",
         "prime minister",
         "privy council",
@@ -562,7 +538,6 @@ def committee_is_important(meeting):
         "national security adviser",
         "national security",
 
-        # Political subjects
         "cbc",
         "canadian broadcasting corporation",
         "gun control",
@@ -570,7 +545,6 @@ def committee_is_important(meeting):
         "carbon tax",
         "carbon pricing",
 
-        # Major controversies / institutions
         "nato",
         "military headquarters",
         "foreign interference",
@@ -592,36 +566,17 @@ def committee_is_important(meeting):
         "rcmp"
     ]
 
-    for term in important_terms:
-
-        if term in combined:
-            return True
-
-    return False
+    return any(
+        term in combined
+        for term in important_terms
+    )
 
 
 def get_committee_meetings():
 
-    """
-    Retrieve House of Commons committee meetings occurring
-    TODAY in Ottawa/Toronto time.
-
-    We deliberately handle:
-
-        - explicit dates
-        - Later Today
-        - Earlier Today
-        - Today
-        - Tomorrow
-
-    This is important because the House page can change a
-    meeting's label during the day.
-    """
-
     meetings = []
 
     print("")
-    print("Checking House of Commons committees...")
     print(
         f"Committee date we're looking for: "
         f"{today_toronto}"
@@ -632,7 +587,7 @@ def get_committee_meetings():
         response = requests.get(
             COMMITTEE_MEETINGS_URL,
             headers=HEADERS,
-            timeout=20
+            timeout=COMMITTEE_TIMEOUT
         )
 
         response.raise_for_status()
@@ -669,8 +624,6 @@ def get_committee_meetings():
                     strip=True
                 ).lower()
 
-            # Suspended meetings are historical, even though
-            # they remain on the page.
             if "suspended" in status:
 
                 print(
@@ -678,7 +631,6 @@ def get_committee_meetings():
                 )
 
                 continue
-
 
             # -------------------------------------------------
             # COMMITTEE
@@ -696,7 +648,6 @@ def get_committee_meetings():
                 strip=True
             )
 
-
             # -------------------------------------------------
             # DATE / TIME
             # -------------------------------------------------
@@ -713,15 +664,12 @@ def get_committee_meetings():
                 strip=True
             )
 
-            # First try an explicit date.
             meeting_date = parse_committee_date(
                 date_text
             )
 
             date_source = "explicit date"
 
-            # If the card doesn't contain the date, look for
-            # relative labels.
             if meeting_date is None:
 
                 meeting_date = (
@@ -732,8 +680,6 @@ def get_committee_meetings():
 
                 date_source = "relative label"
 
-            # If that still fails, inspect the broader
-            # meeting block.
             if meeting_date is None:
 
                 block_text = block.get_text(
@@ -747,7 +693,6 @@ def get_committee_meetings():
 
                 date_source = "block text"
 
-            # Never guess.
             if meeting_date is None:
 
                 print(
@@ -762,7 +707,6 @@ def get_committee_meetings():
                 f"({date_source})"
             )
 
-            # This is the key test.
             if meeting_date != today_toronto:
 
                 print(
@@ -772,14 +716,12 @@ def get_committee_meetings():
 
                 continue
 
-
             # -------------------------------------------------
             # TIME
             # -------------------------------------------------
 
             time_text = date_text
 
-            # Remove explicit date if present.
             time_text = re.sub(
                 r"""
                 (?P<month>
@@ -800,7 +742,6 @@ def get_committee_meetings():
                 time_text
             ).strip()
 
-
             # -------------------------------------------------
             # LOCATION
             # -------------------------------------------------
@@ -818,18 +759,15 @@ def get_committee_meetings():
                     strip=True
                 )
 
-
             # -------------------------------------------------
             # BROADCAST
             # -------------------------------------------------
 
             broadcast = ""
 
-            attributes = block.select(
+            for attribute in block.select(
                 ".meeting-card-attribute"
-            )
-
-            for attribute in attributes:
+            ):
 
                 attribute_text = attribute.get_text(
                     " ",
@@ -859,7 +797,6 @@ def get_committee_meetings():
                         )
                     )
 
-
             # -------------------------------------------------
             # STUDIES / ACTIVITIES
             # -------------------------------------------------
@@ -880,7 +817,6 @@ def get_committee_meetings():
                     studies.append(
                         study_text
                     )
-
 
             # -------------------------------------------------
             # NOTICE URL
@@ -914,7 +850,6 @@ def get_committee_meetings():
                         + notice_url
                     )
 
-
             # -------------------------------------------------
             # MEETING PAGE
             # -------------------------------------------------
@@ -936,7 +871,6 @@ def get_committee_meetings():
                     + meeting_id
                 )
 
-
             # -------------------------------------------------
             # NOTICE DETAILS
             # -------------------------------------------------
@@ -953,33 +887,36 @@ def get_committee_meetings():
                     f"{committee}..."
                 )
 
+                notice_start = time.perf_counter()
+
                 notice_details = (
                     extract_notice_details(
                         notice_url
                     )
                 )
 
+                notice_elapsed = (
+                    time.perf_counter()
+                    - notice_start
+                )
 
-            # -------------------------------------------------
-            # BUILD MEETING
-            # -------------------------------------------------
+                if notice_elapsed > 5:
+
+                    print(
+                        f"WARNING: Notice for "
+                        f"{committee} took "
+                        f"{notice_elapsed:.1f}s"
+                    )
 
             meeting = {
 
                 "committee": committee,
-
                 "date": meeting_date,
-
                 "time": time_text,
-
                 "location": location,
-
                 "broadcast": broadcast,
-
                 "studies": studies,
-
                 "meeting_page": meeting_page,
-
                 "notice_url": notice_url,
 
                 "subject": notice_details.get(
@@ -999,10 +936,7 @@ def get_committee_meetings():
                 )
             )
 
-            meetings.append(
-                meeting
-            )
-
+            meetings.append(meeting)
 
     except Exception as error:
 
@@ -1017,8 +951,6 @@ def get_committee_meetings():
 
         return []
 
-
-    # Keep chronological order.
     meetings.sort(
         key=lambda meeting: meeting["time"]
     )
@@ -1031,15 +963,14 @@ def get_committee_meetings():
     return meetings
 
 
+log("Checking House of Commons committees...")
 committee_meetings = get_committee_meetings()
+log("Committee scraping complete.")
 
 
-# ---------------------------------------------------------
-# COLLECT NEWS STORIES
-# ---------------------------------------------------------
-
-all_stories = []
-
+# =========================================================
+# STORY CLASSIFICATION
+# =========================================================
 
 def classify_story(title):
 
@@ -1054,6 +985,7 @@ def classify_story(title):
         "air fryer",
         "dorm-friendly"
     ]):
+
         return "lifestyle"
 
     if any(word in title_lower for word in [
@@ -1063,6 +995,7 @@ def classify_story(title):
         "column:",
         "view:"
     ]):
+
         return "opinion"
 
     if any(word in title_lower for word in [
@@ -1071,17 +1004,17 @@ def classify_story(title):
         "gallery",
         "cartoonists"
     ]):
+
         return "feature"
 
-
     # ---------------------------------------------------------
-    # POLITICAL RELEVANCE SCORING
+    # POLITICAL RELEVANCE
     # ---------------------------------------------------------
 
     political_score = 0
 
-    # Strong political signals
     strong_terms = [
+
         "prime minister",
         "parliament",
         "house of commons",
@@ -1116,8 +1049,8 @@ def classify_story(title):
         "elections canada"
     ]
 
-    # Canadian political figures
     politician_terms = [
+
         "mark carney",
         "pierre poilievre",
         "danielle smith",
@@ -1134,8 +1067,8 @@ def classify_story(title):
         "francois-philippe champagne"
     ]
 
-    # Major political/public-policy subjects
     policy_terms = [
+
         "tariff",
         "tariffs",
         "trade deal",
@@ -1176,8 +1109,8 @@ def classify_story(title):
         "foreign policy"
     ]
 
-    # Political institutions / government departments
     institution_terms = [
+
         "ottawa",
         "parliament hill",
         "treasury board",
@@ -1193,36 +1126,38 @@ def classify_story(title):
         "committee hearing"
     ]
 
-
-    # ---------------------------------------------------------
-    # CALCULATE SCORE
-    # ---------------------------------------------------------
-
     for term in strong_terms:
+
         if term in title_lower:
+
             political_score += 3
 
     for term in politician_terms:
+
         if term in title_lower:
+
             political_score += 4
 
     for term in policy_terms:
+
         if term in title_lower:
+
             political_score += 2
 
     for term in institution_terms:
+
         if term in title_lower:
+
             political_score += 1
 
-
     # ---------------------------------------------------------
-    # SPECIAL CASES
+    # TRUMP SPECIAL CASE
     # ---------------------------------------------------------
 
-    # Stories about Trump are often political, but we don't want
-    # every Trump story unless there is a Canadian angle.
     if "trump" in title_lower:
+
         canadian_angle_terms = [
+
             "canada",
             "canadian",
             "carney",
@@ -1238,42 +1173,77 @@ def classify_story(title):
             "cusma"
         ]
 
-        if any(term in title_lower for term in canadian_angle_terms):
+        if any(
+            term in title_lower
+            for term in canadian_angle_terms
+        ):
+
             political_score += 3
+
         else:
+
             political_score -= 2
 
-
-    # ---------------------------------------------------------
-    # FINAL CLASSIFICATION
-    # ---------------------------------------------------------
-
     if political_score >= 3:
-        print(f"✓ POLITICAL ({political_score}): {title}")
+
+        print(
+            f"✓ POLITICAL ({political_score}): "
+            f"{title}"
+        )
+
         return "news"
 
-    print(f"✗ NON-POLITICAL ({political_score}): {title}")
+    print(
+        f"✗ NON-POLITICAL ({political_score}): "
+        f"{title}"
+    )
+
     return "non_political"
 
 
-for name, url in FEEDS.items():
+# =========================================================
+# FETCH ONE FEED
+# =========================================================
 
-    print(f"Checking {name}...")
+def fetch_feed(name, url):
+
+    start = time.perf_counter()
+
+    print(
+        f"Checking {name}..."
+    )
 
     try:
 
+        # Use requests rather than feedparser's built-in
+        # URL fetching so that the timeout is explicit.
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=FEED_TIMEOUT
+        )
+
+        response.raise_for_status()
+
         feed = feedparser.parse(
-            url
+            response.content
         )
 
         if feed.bozo and not feed.entries:
 
-            print(
-                f"Could not retrieve {name}. "
-                f"Skipping it."
+            elapsed_feed = (
+                time.perf_counter()
+                - start
             )
 
-            continue
+            print(
+                f"WARNING: {name} returned no usable "
+                f"entries after {elapsed_feed:.1f}s."
+            )
+
+            return name, []
+
+        stories = []
 
         for article in feed.entries:
 
@@ -1284,14 +1254,30 @@ for name, url in FEEDS.items():
             )
 
             if not published_time:
+
+                published_time = (
+                    article.get(
+                        "updated_parsed"
+                    )
+                )
+
+            if not published_time:
+
                 continue
 
-            published = datetime(
-                *published_time[:6],
-                tzinfo=timezone.utc
-            )
+            try:
+
+                published = datetime(
+                    *published_time[:6],
+                    tzinfo=timezone.utc
+                )
+
+            except Exception:
+
+                continue
 
             if published < cutoff_time:
+
                 continue
 
             title = article.get(
@@ -1308,36 +1294,134 @@ for name, url in FEEDS.items():
                 title
             )
 
-            # Only regular news.
             if category != "news":
+
                 continue
 
-            all_stories.append({
+            stories.append({
 
                 "source": name,
-
                 "title": title,
-
                 "link": link,
-
                 "published": published
             })
 
+        elapsed_feed = (
+            time.perf_counter()
+            - start
+        )
+
+        if elapsed_feed > 5:
+
+            print(
+                f"WARNING: {name} took "
+                f"{elapsed_feed:.1f}s "
+                f"and produced {len(stories)} stories."
+            )
+
+        else:
+
+            print(
+                f"{name} completed in "
+                f"{elapsed_feed:.1f}s "
+                f"({len(stories)} stories)."
+            )
+
+        return name, stories
+
+    except requests.exceptions.Timeout:
+
+        elapsed_feed = (
+            time.perf_counter()
+            - start
+        )
+
+        print(
+            f"TIMEOUT: {name} took "
+            f"{elapsed_feed:.1f}s and was skipped."
+        )
+
+        return name, []
+
     except Exception as error:
 
-        print(
-            f"Could not retrieve {name}. "
-            f"Skipping it."
+        elapsed_feed = (
+            time.perf_counter()
+            - start
         )
 
         print(
-            f"Error: {error}"
+            f"ERROR: {name} failed after "
+            f"{elapsed_feed:.1f}s: {error}"
         )
 
+        return name, []
 
-# ---------------------------------------------------------
+
+# =========================================================
+# COLLECT NEWS STORIES — IN PARALLEL
+# =========================================================
+
+log(
+    f"Starting parallel collection from "
+    f"{len(FEEDS)} news feeds..."
+)
+
+all_stories = []
+
+feed_start = time.perf_counter()
+
+with ThreadPoolExecutor(
+    max_workers=min(8, len(FEEDS))
+) as executor:
+
+    future_to_name = {
+        executor.submit(
+            fetch_feed,
+            name,
+            url
+        ): name
+
+        for name, url in FEEDS.items()
+    }
+
+    for future in as_completed(
+        future_to_name
+    ):
+
+        name = future_to_name[future]
+
+        try:
+
+            feed_name, stories = (
+                future.result()
+            )
+
+            all_stories.extend(
+                stories
+            )
+
+        except Exception as error:
+
+            print(
+                f"Unexpected error processing "
+                f"{name}: {error}"
+            )
+
+feed_elapsed = (
+    time.perf_counter()
+    - feed_start
+)
+
+log(
+    f"All feeds complete in "
+    f"{feed_elapsed:.1f}s."
+)
+
+
+# =========================================================
 # GROUP STORIES BY SOURCE
-# ---------------------------------------------------------
+# =========================================================
 
 stories_by_source = defaultdict(
     list
@@ -1351,7 +1435,6 @@ for story in all_stories:
         story
     )
 
-
 for source in stories_by_source:
 
     stories_by_source[source].sort(
@@ -1360,9 +1443,9 @@ for source in stories_by_source:
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # BUILD EMAIL
-# ---------------------------------------------------------
+# =========================================================
 
 today_display = now_toronto.strftime(
     "%B %-d, %Y"
@@ -1379,9 +1462,9 @@ message["From"] = email_address
 message["To"] = email_address
 
 
-# ---------------------------------------------------------
+# =========================================================
 # PLAIN TEXT VERSION
-# ---------------------------------------------------------
+# =========================================================
 
 text_lines = []
 
@@ -1546,9 +1629,9 @@ plain_text = "\n".join(
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HTML VERSION
-# ---------------------------------------------------------
+# =========================================================
 
 html_parts = []
 
@@ -1723,9 +1806,9 @@ html_parts.append(
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # WEATHER HTML
-# ---------------------------------------------------------
+# =========================================================
 
 if weather:
 
@@ -1757,9 +1840,9 @@ if weather:
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # COMMITTEES HTML
-# ---------------------------------------------------------
+# =========================================================
 
 if committee_meetings:
 
@@ -1914,9 +1997,9 @@ if committee_meetings:
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # STORY COUNT
-# ---------------------------------------------------------
+# =========================================================
 
 html_parts.append(
     f"<p>{len(all_stories)} news stories "
@@ -1924,9 +2007,9 @@ html_parts.append(
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # NEWS STORIES HTML
-# ---------------------------------------------------------
+# =========================================================
 
 for source in sorted(
     stories_by_source
@@ -1975,9 +2058,11 @@ html_body = "".join(
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # SEND EMAIL
-# ---------------------------------------------------------
+# =========================================================
+
+log("Preparing email...")
 
 message.set_content(
     plain_text
@@ -1988,25 +2073,65 @@ message.add_alternative(
     subtype="html"
 )
 
+email_start = time.perf_counter()
 
-with smtplib.SMTP_SSL(
-    "smtp.gmail.com",
-    465
-) as smtp:
+try:
 
-    smtp.login(
-        email_address,
-        app_password
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+        timeout=20
+    ) as smtp:
+
+        smtp.login(
+            email_address,
+            app_password
+        )
+
+        smtp.send_message(
+            message
+        )
+
+except Exception as error:
+
+    log(
+        f"EMAIL ERROR: {error}"
     )
 
-    smtp.send_message(
-        message
-    )
+    raise
 
-
-print(
-    f"Digest sent successfully! "
-    f"{len(all_stories)} news stories included "
-    f"and {len(committee_meetings)} committee "
-    f"meetings included."
+email_elapsed = (
+    time.perf_counter()
+    - email_start
 )
+
+log(
+    f"Email sent in {email_elapsed:.1f}s."
+)
+
+
+# =========================================================
+# FINAL DIAGNOSTICS
+# =========================================================
+
+total_elapsed = elapsed()
+
+print("")
+print("=" * 60)
+print("DIGEST COMPLETE")
+print("=" * 60)
+print(
+    f"Total runtime: {total_elapsed:.1f} seconds"
+)
+print(
+    f"News stories: {len(all_stories)}"
+)
+print(
+    f"Committee meetings: "
+    f"{len(committee_meetings)}"
+)
+print(
+    f"Weather retrieved: "
+    f"{'Yes' if weather else 'No'}"
+)
+print("=" * 60)
